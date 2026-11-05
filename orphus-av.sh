@@ -236,6 +236,8 @@
 #                            given; otherwise compiles from source (needs a
 #                            C toolchain — auto-installed via whichever of
 #                            apt/dnf/yum/zypper/pacman/apk is present).
+#   --yara-url-sha256 HASH    Expected SHA256 of the --yara-url tarball;
+#                            without it the download is refused.
 #   --yara-url URL            Install yara/yarac from a prebuilt tarball at
 #                            this URL instead of compiling — no compiler
 #                            needed on the target machine. YARA publishes no
@@ -489,6 +491,7 @@ DO_SETUP=false         # --setup: build yara/yarac (and fetch busybox) then exit
 SETUP_FORCE=false       # --setup --force: rebuild even if already present
 SETUP_COMPILE_ONLY=false # --setup --compile: skip --yara-url, always compile
 DO_CHECK_DEPS=false     # --check-deps: print dependency status and exit
+YARA_URL_SHA256=""      # --yara-url-sha256: required pin for --yara-url
 YARA_URL_ARG=""         # --yara-url: fetch a prebuilt yara/yarac tarball
                         # instead of compiling from source (own mirror/CDN)
 BUSYBOX_URL_ARG=""      # --busybox-url: override the busybox download URL
@@ -648,6 +651,40 @@ now_ms() {
 # ============================================================================
 # 3. MODULE: busybox bootstrap (find / auto-download / bb wrapper)
 # ============================================================================
+# C5: pinned SHA256 of every artifact --setup / auto-download fetches.
+# Recorded 2026-11-05; the GNU tarballs matched on two independent mirrors
+# (ftp.gnu.org, mirrors.kernel.org). A custom version/URL has no pin and
+# is refused unless ORPHUS_ALLOW_UNPINNED=1 (then only warned).
+_pinned_sha256() {
+    case "$1" in
+        busybox-1.35.0-x86_64)  echo 6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348 ;;
+        yara-4.5.8.tar.gz)      echo c322414975ff6f701149856613afdcd92a7e6939c284c798ae3c85618197efaa ;;
+        grep-3.11.tar.gz)       echo 1f31014953e71c3cddcedb97692ad7620cb9d6d04fbdc19e0d8dd836f87622bb ;;
+        bash-5.2.21.tar.gz)     echo c8e31bdc59b69aaffc5b36509905ba3e5cbb12747091d27b4b977f078560d5b8 ;;
+        yara-url)               echo "${YARA_URL_SHA256:-}" ;;
+    esac
+}
+# verify_pinned FILE KEY -> 0 if the file matches its pinned hash.
+verify_pinned() {
+    local file="$1" key="$2" want got
+    want=$(_pinned_sha256 "$key")
+    if [ -z "$want" ]; then
+        if [ "${ORPHUS_ALLOW_UNPINNED:-0}" = 1 ]; then
+            echo -e "${Y}[WARN] No pinned SHA256 for '$key' -> NOT verified (ORPHUS_ALLOW_UNPINNED=1)${Z}"
+            return 0
+        fi
+        echo -e "${R}[FAIL] No pinned SHA256 for '$key'; refusing an unverified download (set ORPHUS_ALLOW_UNPINNED=1 to override)${Z}"
+        return 1
+    fi
+    got=$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1)
+    [ -z "$got" ] && got=$(openssl dgst -sha256 "$file" 2>/dev/null | awk '{print $NF}')
+    if [ "$got" != "$want" ]; then
+        echo -e "${R}[FAIL] SHA256 mismatch for '$key': got ${got:-none}, expected $want${Z}"
+        return 1
+    fi
+    return 0
+}
+
 net_fetch() {
     # Downloader chain: busybox wget -> system wget -> system curl.
     # Optional 4th arg is a User-Agent (e.g. for the ClamAV mirror).
@@ -827,15 +864,19 @@ find_local_busybox() {
 }
 
 download_busybox() {
-    local url="$1" dest="$SCRIPT_DIR/bin/busybox"
+    local url="$1" dest="$SCRIPT_DIR/bin/busybox" key="busybox-custom-url"
+    case "$url" in
+        https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox) key="busybox-1.35.0-x86_64" ;;
+    esac
     mkdir -p "$SCRIPT_DIR/bin"
     echo -e "${C}[*] BusyBox not found locally -> auto-downloading (~1MB)...${Z}"
-    if net_fetch "$url" "$dest" 15 "" 10 && verify_busybox_binary "$dest" 2>/dev/null; then
-        :
-    else
-        chmod +x "$dest" 2>/dev/null
-        verify_busybox_binary "$dest" || { rm -f "$dest" 2>/dev/null; echo -e "${R}[FAIL] BusyBox download/verify failed${Z}"; return 1; }
-    fi
+    net_fetch "$url" "$dest" 15 "" 10
+    # An internal mirror (--busybox-url) serving the same binary is fine.
+    [ "$(sha256sum "$dest" 2>/dev/null | cut -d' ' -f1)" = "$(_pinned_sha256 busybox-1.35.0-x86_64)" ] && key="busybox-1.35.0-x86_64"
+    # Hash first: never execute (--help check below) an unverified binary.
+    verify_pinned "$dest" "$key" || { rm -f "$dest" 2>/dev/null; return 1; }
+    chmod +x "$dest" 2>/dev/null
+    verify_busybox_binary "$dest" || { rm -f "$dest" 2>/dev/null; echo -e "${R}[FAIL] BusyBox download/verify failed${Z}"; return 1; }
     chmod +x "$dest" 2>/dev/null
     echo -e "${G}[OK] busybox saved: $dest${Z}"
     BUSYBOX_BIN="$dest"
@@ -1122,6 +1163,8 @@ install_yara_from_url() {
         return 1
     fi
 
+    verify_pinned "$dest" "yara-url" || { echo -e "${R}[FAIL] Pass the tarball's SHA256 with --yara-url-sha256${Z}"; rm -rf "$workdir"; return 1; }
+
     local extract_dir="$workdir/extract"
     mkdir -p "$extract_dir"
     if tar -xzf "$dest" -C "$extract_dir" 2>/dev/null || tar -xf "$dest" -C "$extract_dir" 2>/dev/null; then
@@ -1187,6 +1230,7 @@ build_yara_from_source() {
         rm -rf "$workdir"
         return 1
     fi
+    verify_pinned "$workdir/yara.tar.gz" "yara-${version}.tar.gz" || { rm -rf "$workdir"; return 1; }
     tar -xzf "$workdir/yara.tar.gz" -C "$workdir" || { echo -e "${R}[FAIL] Corrupt download${Z}"; rm -rf "$workdir"; return 1; }
 
     (
@@ -1273,6 +1317,7 @@ build_grep_from_source() {
         rm -rf "$workdir"
         return 1
     fi
+    verify_pinned "$workdir/grep.tar.gz" "grep-${version}.tar.gz" || { rm -rf "$workdir"; return 1; }
     tar -xzf "$workdir/grep.tar.gz" -C "$workdir" || { echo -e "${R}[FAIL] Corrupt download${Z}"; rm -rf "$workdir"; return 1; }
 
     (
@@ -1360,6 +1405,7 @@ build_bash_from_source() {
         rm -rf "$workdir"
         return 1
     fi
+    verify_pinned "$workdir/bash.tar.gz" "bash-${version}.tar.gz" || { rm -rf "$workdir"; return 1; }
     tar -xzf "$workdir/bash.tar.gz" -C "$workdir" || { echo -e "${R}[FAIL] Corrupt download${Z}"; rm -rf "$workdir"; return 1; }
 
     (
@@ -1471,6 +1517,7 @@ parse_args() {
             -b|--busybox)    BUSYBOX_PATH_ARG="$2"; shift 2 ;;
             --busybox-url)   BUSYBOX_URL_ARG="$2"; shift 2 ;;
             --yara-url)      YARA_URL_ARG="$2"; shift 2 ;;
+            --yara-url-sha256) YARA_URL_SHA256="$2"; shift 2 ;;
             --mb-key)        MB_KEY="$2"; shift 2 ;;
             -q|--quarantine) QUARANTINE_ENABLED=true; shift ;;
             --quarantine-dry-run) QUARANTINE_ENABLED=true; QUARANTINE_DRY_RUN=true; shift ;;
@@ -3126,6 +3173,7 @@ extract_setup_module() {
         echo 'R="" G="" Y="" C="" B="" Z=""'
         echo '[ -t 1 ] && { R="\033[0;31m"; Y="\033[1;33m"; G="\033[0;32m"; C="\033[0;36m"; B="\033[1m"; Z="\033[0m"; }'
         echo 'YARA_URL_ARG="${YARA_URL_ARG:-}"'
+        echo 'YARA_URL_SHA256="${YARA_URL_SHA256:-}"'
         echo 'SETUP_FORCE="${SETUP_FORCE:-false}"'
         echo 'SETUP_COMPILE_ONLY="${SETUP_COMPILE_ONLY:-false}"'
         echo 'BUSYBOX_BIN="${BUSYBOX_BIN:-}"'
@@ -5705,9 +5753,18 @@ quarantine_file() {
     # earlier evidence copy; basename capped to stay under NAME_MAX.
     local base; base=$(basename -- "$src"); base="${base:0:120}"
     qfile="${QUARANTINE_DIR}/${path_hash}_${ts}_${base}"
-    local meta sum
+    local meta sum ino
     meta=$(stat -c '%u:%g:%a' -- "$real" 2>/dev/null)
+    ino=$(stat -c '%d:%i' -- "$real" 2>/dev/null)
     sum=$(bb sha256sum -- "$real" 2>/dev/null | cut -d' ' -f1)
+    # Re-check right before the move: same resolved path, same dev:inode.
+    # Shrinks the swap window to microseconds; a full fix needs
+    # openat(O_NOFOLLOW) in compiled code (bash cannot do it).
+    if [ "$(realpath -e -- "$real" 2>/dev/null || readlink -f -- "$real" 2>/dev/null)" != "$real" ] || \
+       [ "$(stat -c '%d:%i' -- "$real" 2>/dev/null)" != "$ino" ]; then
+        log "QUARANTINE_SKIPPED (path changed during quarantine): $src ($type)"
+        return 0
+    fi
 
     if mv -- "$real" "$qfile" 2>/dev/null; then
         chmod "$QUARANTINE_PERM" "$qfile" 2>/dev/null
@@ -6152,13 +6209,21 @@ _flush_batches() {
 }
 
 run_scan_loop() {
-    local col1 col2 col3 file size oct magic_type skip_deep ext rc
+    local col1 col2 col3 file size oct magic_type skip_deep ext rc line pending="" r
 
     while :; do
-        IFS=$'\t' read -r -t 2 col1 col2 col3; rc=$?
-        # >128 = read timed out (idle FIFO in -w mode): flush and keep waiting.
-        if [ "$rc" -gt 128 ]; then _flush_batches; continue; fi
-        [ "$rc" -ne 0 ] && [ -z "$col1" ] && break
+        IFS= read -r -t 2 line; rc=$?
+        # >128 = read timed out (idle FIFO in -w mode): keep any partial
+        # line (bash stores it in $line), flush batches, keep waiting.
+        if [ "$rc" -gt 128 ]; then pending+="$line"; _flush_batches; continue; fi
+        line="$pending$line"; pending=""
+        [ "$rc" -ne 0 ] && [ -z "$line" ] && break
+        # Pool line is "size<TAB>mode<TAB>path" or just "path".
+        if [[ "$line" == *$'\t'*$'\t'* ]]; then
+            col1="${line%%$'\t'*}"; r="${line#*$'\t'}"; col2="${r%%$'\t'*}"; col3="${r#*$'\t'}"
+        else
+            col1="$line"; col2=""; col3=""
+        fi
         file=""; size=""; oct=""
         if [ -n "${col3:-}" ]; then
             size="$col1"; oct="$col2"; file="$col3"
