@@ -3780,32 +3780,26 @@ detect_cms() {
 
 print_banner() {
     echo -e "${B}=================================================${Z}"
-    echo -e "${B} Oprhus AV Scanner Unified v${VERSION}${Z}  [OS: $OS | ARCH: $ARCH]"
-    echo -e " RAM Ceiling  : ${C}${MAX_RAM_MB} MB${Z}"
-    echo -e " Workers      : ${C}${WORKERS}${Z}"
-    echo -e " Target       : ${C}${ROOT_DIR}${Z}"
-    echo -e " Signatures   : ${C}${SIGNATURES}${Z}"
-    echo -e " Max size     : ${C}${MAX_SCAN_MB} MB${Z}"
+    echo -e "${B} Orphus AV Scanner Unified v${VERSION}${Z}  [OS: $OS | ARCH: $ARCH]"
+    echo -e " Target     : ${C}${ROOT_DIR}${Z}"
+    echo -e " Signatures : ${C}${SIGNATURES}${Z}"
+    echo -e " Workers    : ${C}${WORKERS}${Z}  (RAM ceiling ${C}${MAX_RAM_MB} MB${Z})"
+    echo -e " Max size   : ${C}${MAX_SCAN_MB} MB${Z}"
     local cms_detected; cms_detected=$(detect_cms "$ROOT_DIR")
-    [ -n "$cms_detected" ] && echo -e " Detected CMS : ${C}${cms_detected}${Z} (informational only — nothing is excluded based on this)"
-    echo -e " SHA256 / MD5 : ${C}${SHA256_CMD} / ${MD5_CMD}${Z}"
-    echo -e " YARA         : ${C}${YARA_CMD}${Z}"
-    echo -e " strings/file : ${C}${STRINGS_CMD} / built-in magic-bytes${Z}"
-    if [ -n "$BUSYBOX_BIN" ]; then
-        echo -e " BusyBox      : ${G}ON${Z} -> ${BUSYBOX_BIN}"
-    elif [ "$ALLOW_BUSYBOX" = false ]; then
-        echo -e " BusyBox      : ${Y}off (--no-busybox, intentional)${Z}"
-    else
-        echo -e " BusyBox      : ${R}MISSING (system-only) — unusual, check the package${Z}"
-    fi
+    [ -n "$cms_detected" ] && echo -e " CMS        : ${C}${cms_detected}${Z} (info only)"
     if [ "$QUARANTINE_ENABLED" = true ]; then
-        echo -e " Quarantine   : ${C}ON -> ${QUARANTINE_DIR} (perm ${QUARANTINE_PERM})${Z}"
+        echo -e " Quarantine : ${C}ON -> ${QUARANTINE_DIR} (perm ${QUARANTINE_PERM})${Z}"
     else
-        echo -e " Quarantine   : off"
+        echo -e " Quarantine : off"
     fi
     if [ "$REALTIME_MODE" = true ]; then
-        echo -e " Real-time    : ${C}ON${Z} (starts after the base scan)"
+        echo -e " Real-time  : ${C}ON${Z} (starts after the base scan)"
     fi
+    # Missing YARA = YARA and converted ClamAV rules don't run: a coverage gap, keep it loud.
+    [ "$YARA_CMD" = none ] && echo -e " YARA       : ${R}NOT AVAILABLE - YARA/ClamAV rules are skipped${Z}"
+    local bb_state="${G}${BUSYBOX_BIN}${Z}"
+    [ -z "$BUSYBOX_BIN" ] && { [ "$ALLOW_BUSYBOX" = false ] && bb_state="${Y}off (--no-busybox)${Z}" || bb_state="${R}MISSING${Z}"; }
+    echo -e " Tools      : sha256=${SHA256_CMD} md5=${MD5_CMD} yara=${YARA_CMD} strings=${STRINGS_CMD} busybox=${bb_state}"
     echo -e "${B}=================================================${Z}"
 }
 
