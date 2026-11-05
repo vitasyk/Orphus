@@ -6461,7 +6461,9 @@ process_hash_batch() {
     local hits
     # coreutils prints "\<hash>  <escaped name>" for names containing "\" or
     # a newline (H2), so the leading "\" is stripped before the lookup.
-    hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | sed 's/^\\//' | _real_grep -F -f - "$sig_file" 2>/dev/null | cut -f1 | sort -u)
+    # Hex-only: busybox doesn't escape newlines in names, so a name with an
+    # empty line would become an empty pattern matching every database line.
+    hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | sed 's/^\\//' | bb grep -E '^[0-9a-fA-F]{32,64}$' | _real_grep -F -f - "$sig_file" 2>/dev/null | cut -f1 | sort -u)
     if [ -n "$hits" ]; then
         local hit_hash tname ln h f
         while IFS= read -r hit_hash; do
