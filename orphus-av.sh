@@ -1932,27 +1932,16 @@ update_signatures() {
         echo "  ! git not found (outside busybox) -> YARA rule update skipped"
     fi
 
-    if command -v yarac &>/dev/null; then
-        echo "  [*] Compiling YARA rules (may take time)..."
-        local yara_index="$yara_dir/index.yar"
-        local yara_compiled="$yara_dir/rules.yarc"
-        > "$yara_index"
-        find "$yara_dir" -type f \( -name "*.yar" -o -name "*.yara" \) ! -name "index.yar" 2>/dev/null | while read -r yfile; do
-            if yarac "$yfile" /dev/null &>/dev/null; then
-                echo "include \"$yfile\"" >> "$yara_index"
-            fi
-        done
-        if [ -s "$yara_index" ] && yarac "$yara_index" "$yara_compiled" &>/dev/null; then
-            echo "  ✓ YARA compiled -> rules.yarc"
-        else
-            echo "  ! YARA index compile failed -> will use text rules"
-            rm -f "$yara_compiled" 2>/dev/null
-        fi
-    else
-        echo "  ! yarac not found -> text rules only"
-    fi
+    # FIX (audit): a signatures/yara/index.yar + rules.yarc used to be built
+    # here. Nothing reads them (compile_signatures builds its own ruleset),
+    # and that index.yar was picked up by compile_signatures' *.yar search
+    # as one more source, so every rule was included twice -> "duplicated
+    # identifier" -> the combined YARA compile failed.
 
     # 5. Custom boilerplate
+    # custom.strings: one LITERAL text per line, case-insensitive (YARA
+    # literal string / grep -F). No regex, no comments, no blank lines — a
+    # "#" or empty line would itself become a pattern for grep -F.
     local custom_dir="$sig_dir/custom"
     if [ ! -f "$custom_dir/custom.strings" ]; then
         cat << 'EOF' > "$custom_dir/custom.strings"
@@ -1961,9 +1950,6 @@ eval(base64_decode
 bash -i >
 nc -e /bin
 python -c import socket
-PHPDATA.*mbd;[0-9-]+\s*<\/PHPDATA>
-round\((\d+\.?\d*\+?){2,}\)
-goto [A-Za-z0-9_]+;
 EOF
     fi
     [ ! -f "$custom_dir/custom.md5" ] && cat << 'EOF' > "$custom_dir/custom.md5"
@@ -3022,8 +3008,26 @@ EOF
         fi
     fi
 
+    # FIX (audit): includes are written RELATIVE ("x.yar"; YARA resolves an
+    # include against the including file's dir). out_dir is a per-run temp
+    # dir, and index.yar is cached and reused from another one next run —
+    # absolute includes pointed at a deleted dir there and YARA failed.
+    # index.yar/_index.yar are our own output names: never take them as a
+    # source (a stale signatures/yara/index.yar from older versions
+    # duplicated every rule; and index.yar would include itself).
     local yar_sources
-    yar_sources=$(bb find "$out_dir/yara" -maxdepth 1 \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null)
+    # Include order decides who wins a rule-name clash (dedup loop below:
+    # the earlier file stays): our generated_*.yar (converted ClamAV +
+    # string sigs) first, then external files largest-first (name as a
+    # tie-break, deterministic) so a clash drops the smaller file and
+    # loses the fewest rules (e.g. maldet's big rfxn.yara is kept over a
+    # small Yara-Rules file that repeats a few of its rule names).
+    yar_sources=$(bb find "$out_dir/yara" -maxdepth 1 \( -name "*.yar" -o -name "*.yara" \) \
+        ! -name index.yar ! -name _index.yar 2>/dev/null | \
+        while IFS= read -r yf; do printf '%s\t%s\n' "$(( $(bb wc -c < "$yf") ))" "$yf"; done | \
+        bb sort -t $'\t' -k1,1nr -k2,2 | \
+        bb awk '{ p = substr($0, index($0, "\t") + 1); if (p ~ /\/generated_[^\/]*$/) print p; else rest[++n] = p }
+                END { for (i = 1; i <= n; i++) print rest[i] }')
     if [ -n "$yar_sources" ] && [ -n "$YARAC_BIN" ]; then
         # Validate each file in ISOLATION first and only include the ones
         # that compile cleanly — one incompatible rule (unsupported module,
@@ -3036,7 +3040,7 @@ EOF
         while IFS= read -r yf; do
             [ -z "$yf" ] && continue
             if "$YARAC_BIN" "${yara_extvars[@]}" "$yf" /dev/null &>/dev/null; then
-                echo "include \"$yf\"" >> "$yara_index"
+                echo "include \"${yf##*/}\"" >> "$yara_index"
                 included=$((included + 1))
             else
                 skipped=$((skipped + 1))
@@ -3044,7 +3048,39 @@ EOF
         done <<< "$yar_sources"
         [ "$skipped" -gt 0 ] && echo -e "${Y}[WARN] Skipped ${skipped} incompatible YARA rule file(s) (unsupported module/syntax) — ${included} included${Z}"
 
-        if [ -s "$yara_index" ] && "$YARAC_BIN" "${yara_extvars[@]}" "$yara_index" "$out_dir/yara/rules.yarc" 2>/dev/null; then
+        # FIX (audit): files that compile alone can still clash with EACH
+        # OTHER — the default sources define the same rule names twice
+        # (rfxn.yara vs Yara-Rules EK_Crimepack.yar/MALW_Magento_backend.yar:
+        # "duplicated identifier"), which failed the whole combined compile
+        # and with it ALL YARA, including the converted ClamAV rules. yarac
+        # names every clash as "error: <dir>/FILE(LINE): duplicated
+        # identifier ..." in the file included LATER; drop exactly those
+        # files (the first definition stays) and retry. Any other error ->
+        # stop and use the fallback below, as before.
+        local yerr="$out_dir/yara/_yarac.err" ydrop yrc=1 ytry=0
+        while [ -s "$yara_index" ] && [ "$ytry" -lt 50 ]; do
+            ytry=$((ytry + 1))
+            "$YARAC_BIN" "${yara_extvars[@]}" "$yara_index" "$out_dir/yara/rules.yarc" 2> "$yerr"
+            yrc=$?
+            [ "$yrc" -eq 0 ] && break
+            ydrop=$(bb awk '
+                /^error: / {
+                    if ($0 !~ /[(][0-9]+[)]: duplicated identifier "[^"]*"$/) { bad = 1; exit }
+                    s = $0; sub(/^error: /, "", s); sub(/[(][0-9]+[)]: duplicated identifier "[^"]*"$/, "", s)
+                    n = split(s, p, "/"); if (!(p[n] in seen)) { seen[p[n]] = 1; print p[n] }
+                }
+                END { if (bad) exit 1 }' "$yerr") || break
+            [ -n "$ydrop" ] || break
+            bb awk -v drop="$ydrop" '
+                BEGIN { n = split(drop, d, "\n"); for (i = 1; i <= n; i++) skip["include \"" d[i] "\""] = 1 }
+                !($0 in skip)' "$yara_index" > "$yara_index.tmp"
+            [ "$(bb wc -l < "$yara_index.tmp")" -lt "$(bb wc -l < "$yara_index")" ] || break
+            mv -f "$yara_index.tmp" "$yara_index"
+            echo -e "${Y}[WARN] Dropped YARA file(s) whose rule names are already defined by another file: $(printf '%s' "$ydrop" | tr '\n' ' ')${Z}"
+        done
+        rm -f "$yerr" "$yara_index.tmp" 2>/dev/null
+
+        if [ -s "$yara_index" ] && [ "$yrc" -eq 0 ]; then
             :
         else
             echo -e "${Y}[WARN] yarac failed on the combined ruleset -> falling back to source (slower)${Z}"
@@ -3058,7 +3094,7 @@ EOF
         local yara_index="$out_dir/yara/index.yar"
         : > "$yara_index"
         while IFS= read -r yf; do
-            [ -n "$yf" ] && echo "include \"$yf\"" >> "$yara_index"
+            [ -n "$yf" ] && echo "include \"${yf##*/}\"" >> "$yara_index"
         done <<< "$yar_sources"
     fi
 
@@ -3610,11 +3646,22 @@ init_incremental_cache() {
 # down into $WORK_DIR/all_files.tsv (size\tmode\tpath, the worker's normal
 # 3-field format) — dropping any line whose (path, mtime, size) exactly
 # matches a cache entry. Sets SKIPPED_UNCHANGED for the final report.
+#
+# FIX (audit): a "clean" verdict is only valid for the signature set it was
+# made with. compile_signatures touches signatures/.cache/.compiled on every
+# real (re)compile (-u, changed sources, new script version), so a cache not
+# strictly newer than that flag is ignored here and not merged from in
+# update_incremental_cache — every file is rescanned with the new set.
+_incremental_cache_stale() {
+    local flag="${SIGNATURES}/.cache/.compiled"
+    [ -f "$flag" ] && [ ! "$INCREMENTAL_CACHE_FILE" -nt "$flag" ]
+}
+
 apply_incremental_filter() {
     local raw="$WORK_DIR/all_files_raw.tsv"
     local out="$WORK_DIR/all_files.tsv"
 
-    if [ "$INCREMENTAL_MODE" != true ] || [ ! -s "$INCREMENTAL_CACHE_FILE" ]; then
+    if [ "$INCREMENTAL_MODE" != true ] || [ ! -s "$INCREMENTAL_CACHE_FILE" ] || _incremental_cache_stale; then
         bb awk -F'\t' '{print $1"\t"$2"\t"$4}' "$raw" > "$out" 2>/dev/null
         SKIPPED_UNCHANGED=0
         return
@@ -3649,12 +3696,38 @@ update_incremental_cache() {
     local raw="$WORK_DIR/all_files_raw.tsv"
     [ -s "$raw" ] || return 0
 
+    # FIX (audit): "THREAT:TYPE|path|info" — the path itself may contain
+    # "|" (cut -f2 cut "/w/a|b.php" down to "/w/a", so the real file got
+    # cached clean). Emit every "|"-delimited prefix of "path|info" as a
+    # candidate: extra candidates only keep more files out of the cache.
     local threat_paths="$WORK_DIR/.threat_paths"
-    bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | cut -d'|' -f2 | bb sort -u > "$threat_paths" 2>/dev/null
+    bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | bb awk '
+        {
+            i = index($0, "|"); if (!i) next
+            r = substr($0, i + 1); p = ""
+            while ((j = index(r, "|")) > 0) {
+                p = p substr(r, 1, j - 1); print p
+                p = p "|"; r = substr(r, j + 1)
+            }
+            print p r
+        }' > "$threat_paths" 2>/dev/null
     [ -f "$threat_paths" ] || : > "$threat_paths"
 
+    # FIX (audit): a worker that died (OOM, kill) never wrote its .done
+    # marker (finalize_worker) — its unscanned files must not be cached as
+    # clean. Its pool lines are "size\tmode\tpath": exclude them all.
+    local pool
+    for pool in "$WORK_DIR/reports"/pool_*.txt; do
+        [ -f "$pool" ] || continue
+        [ -f "${pool%.txt}.done" ] && continue
+        bb awk -F'\t' 'NF >= 3 { print $3 }' "$pool" >> "$threat_paths" 2>/dev/null
+    done
+
+    local oldcache="$INCREMENTAL_CACHE_FILE"
+    _incremental_cache_stale && oldcache=/dev/null
+
     local new_cache="${INCREMENTAL_CACHE_FILE}.new"
-    bb awk -F'\t' -v threatfile="$threat_paths" -v oldcache="$INCREMENTAL_CACHE_FILE" '
+    bb awk -F'\t' -v threatfile="$threat_paths" -v oldcache="$oldcache" '
         BEGIN {
             while ((getline line < threatfile) > 0) { threat[line] = 1 }
             close(threatfile)
