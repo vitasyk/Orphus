@@ -571,6 +571,7 @@ DEEP_MODE=false         # --deep/--paranoid: convenience umbrella for a
                         # no exclusions at all; the person reviews and
                         # dismisses findings themselves, not the tool.
 REALTIME_TAIL_PID=""
+REALTIME_WATCH_PID=""
 
 # --- Platform (filled by detect_platform) ---
 OS=""
@@ -4177,48 +4178,126 @@ start_realtime_worker() {
 }
 
 feed_realtime_path() {
-    local path="$1"
+    local path="$1" f
+    # A directory moved in (WordPress unpacks into wp-content/upgrade, then
+    # renames into plugins/) is ONE event; feed every file inside it.
+    if [ -d "$path" ] && [ ! -L "$path" ]; then
+        while IFS= read -r -d '' f; do
+            feed_realtime_path "$f"
+        done < <(command find "$path" -type f -print0 2>/dev/null)
+        return 0
+    fi
     [ -f "$path" ] || return 0
+    case "$path" in
+        *$'\n'*|*$'\t'*)
+            # Same verdict as collect_files' anomaly pass. Never sent to the
+            # worker: a newline splits the FIFO line, two TABs would be parsed
+            # as "size<TAB>mode<TAB>path".
+            f=$(printf '%s' "$path" | tr '\n\t' '??')
+            printf 'THREAT:SUSPICIOUS_FILENAME|%s|contains embedded newline/tab byte in the filename itself -- not scanned via the normal pipeline, which splits on these; investigate directly\n' "$f" >> "$REALTIME_REPORT"
+            [ -n "$LIVE_REPORT_FILE" ] && printf '[%s] [SUSPICIOUS_FILENAME] %s contains embedded newline/tab byte in the filename itself\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$f" >> "$LIVE_REPORT_FILE" 2>/dev/null
+            return 0 ;;
+    esac
     printf '%s\n' "$path" >&3 2>/dev/null || true
+}
+
+# One sorted line per regular file, "<ctime><TAB><path>": a new path OR a
+# changed ctime (edited in place, even with mtime reset by touch -r) gives a
+# line that comm -13 reports. GNU find prints NUL-terminated records; tr turns
+# embedded newlines into \001 so they survive the line-based sort/comm.
+_rt_snapshot() {
+    local ex=(-not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*")
+    if [ "$OS" = "linux" ] && command find "$WORK_DIR" -maxdepth 0 -printf "" 2>/dev/null; then
+        command find "$ROOT_DIR" -type f "${ex[@]}" -printf '%C@\t%p\0' 2>/dev/null | tr '\n\0' '\001\n'
+    elif stat -c '%Z' "$WORK_DIR" >/dev/null 2>&1; then
+        # busybox find: no -printf
+        find "$ROOT_DIR" -type f "${ex[@]}" -exec stat -c $'%Z\t%n' {} + 2>/dev/null
+    else
+        # shortcut: BSD stat (macOS) — new paths only, as before; add stat -f if -w on macOS matters
+        find "$ROOT_DIR" -type f "${ex[@]}" 2>/dev/null | awk '{ print "0\t" $0 }'
+    fi | LC_ALL=C sort
+}
+
+# Feed what changed since the snapshot in $WORK_DIR/rt_known.tsv, then make
+# the new snapshot the reference.
+_rt_poll_once() {
+    local known="$WORK_DIR/rt_known.tsv" cur="$WORK_DIR/rt_current.tsv" line p
+    _rt_snapshot > "$cur"
+    LC_ALL=C comm -13 "$known" "$cur" | while IFS= read -r line; do
+        # no TAB = tail of a newline-split name (busybox stat output)
+        [[ "$line" == *$'\t'* ]] || continue
+        p="${line#*$'\t'}"
+        [ -e "$p" ] || p="${p//$'\001'/$'\n'}"
+        [ -n "$p" ] && feed_realtime_path "$p"
+    done
+    mv -f "$cur" "$known"
+}
+
+# Called before the base scan's file collection, so whatever is created or
+# modified while the base scan runs shows up in the first comparison.
+realtime_baseline() {
+    _rt_snapshot > "$WORK_DIR/rt_known.tsv"
 }
 
 # Streams new THREAT lines from the worker's live report to the console
 tail_realtime_report() {
-    tail -n0 -F "$REALTIME_REPORT" 2>/dev/null | while IFS= read -r line; do
+    # $! must be tail itself (not the reader), so cleanup_realtime kills it
+    tail -n0 -F "$REALTIME_REPORT" 2> /dev/null > >(while IFS= read -r line; do
         case "$line" in
             THREAT:*)
                 echo -e "${R}${B}[RT-THREAT]${Z} ${line#THREAT:}"
                 ;;
         esac
-    done &
+    done) &
     REALTIME_TAIL_PID=$!
 }
 
+_rt_read_events() {
+    local path
+    if [ "$1" = nul ]; then
+        while IFS= read -r -d '' path; do feed_realtime_path "$path"; done
+    else
+        while IFS= read -r path; do feed_realtime_path "$path"; done
+    fi
+}
+
+# Returns only if inotifywait exits (e.g. "upper limit on inotify watches
+# reached"); its stderr is shown then.
 watch_inotify() {
     echo -e "${C}[*] Real-time: using inotifywait (instant reaction)${Z}"
-    inotifywait -m -r -e create -e moved_to -e close_write \
-        --format '%w%f' "$ROOT_DIR" 2>/dev/null | while IFS= read -r path; do
-        feed_realtime_path "$path"
+    local err="$WORK_DIR/rt_inotify.err" fmt=(--format '%w%f') mode=line
+    # NUL-terminated events keep a newline in a filename intact (3.20+).
+    # Not "--help | grep": --help exits non-zero, which pipefail propagates.
+    case "$(inotifywait --help 2>&1)" in
+        *--no-newline*) fmt=(--no-newline --format '%w%f%0'); mode=nul ;;
+    esac
+    : > "$err"
+    inotifywait -m -r -e create -e moved_to -e close_write "${fmt[@]}" \
+        "$ROOT_DIR" 2> "$err" > >(_rt_read_events "$mode") &
+    REALTIME_WATCH_PID=$!
+    while kill -0 "$REALTIME_WATCH_PID" 2>/dev/null && ! grep -q 'Watches established' "$err"; do
+        sleep 1
     done
+    # Catch-up for the gap between the pre-scan snapshot and the watches
+    # being in place (a long base scan); doubles are harmless.
+    kill -0 "$REALTIME_WATCH_PID" 2>/dev/null && _rt_poll_once
+    wait "$REALTIME_WATCH_PID"
+    REALTIME_WATCH_PID=""
+    echo -e "${R}[FAIL] inotifywait exited — real-time watch via inotify ended:${Z}"
+    grep -v -e '^Setting up watches' -e '^Watches established' "$err" >&2
+    return 1
 }
 
 watch_poll() {
-    echo -e "${Y}[WARN] inotifywait not found -> falling back to polling every ${WATCH_INTERVAL}s (install inotify-tools for instant reaction)${Z}"
-    local known="$WORK_DIR/rt_known.tsv" cur="$WORK_DIR/rt_current.tsv"
-    find "$ROOT_DIR" -type f -not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*" 2>/dev/null \
-        | sort > "$known"
+    echo -e "${Y}[WARN] Real-time: polling every ${WATCH_INTERVAL}s (install inotify-tools for instant reaction)${Z}"
     while true; do
+        _rt_poll_once
         sleep "$WATCH_INTERVAL"
-        find "$ROOT_DIR" -type f -not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*" 2>/dev/null \
-            | sort > "$cur"
-        comm -13 "$known" "$cur" | while IFS= read -r newpath; do
-            [ -n "$newpath" ] && feed_realtime_path "$newpath"
-        done
-        mv -f "$cur" "$known"
     done
 }
 
 cleanup_realtime() {
+    [ -n "$REALTIME_WATCH_PID" ] && kill "$REALTIME_WATCH_PID" 2>/dev/null
     exec 3>&- 2>/dev/null || true
     if [ -n "$REALTIME_WORKER_PID" ]; then
         if [ "$HAS_SETSID" = true ]; then
@@ -4240,11 +4319,13 @@ run_realtime_watch() {
     start_realtime_worker || return 1
     tail_realtime_report
 
+    # inotifywait dying (watch limit, killed) falls back to polling instead
+    # of exiting: the limit doesn't go away on restart, polling has none.
     if command -v inotifywait &>/dev/null; then
         watch_inotify
-    else
-        watch_poll
+        echo -e "${Y}[WARN] Real-time: falling back to polling${Z}"
     fi
+    watch_poll
 }
 
 # ============================================================================
@@ -4400,6 +4481,7 @@ main() {
     START_MS=$(now_ms)
     print_banner
 
+    [ "$REALTIME_MODE" = true ] && realtime_baseline
     collect_files
     split_pools
     launch_workers
@@ -4422,9 +4504,13 @@ main() {
 
     # Real-time watch starts AFTER the base scan (the same trap cleanup is
     # already active and covers this phase too — Ctrl+C/SIGTERM stops both
-    # the worker daemon and the FIFO cleanly).
+    # the worker daemon and the FIFO cleanly). Changes made during the base
+    # scan are caught by comparing against realtime_baseline's snapshot.
+    # run_realtime_watch only returns on failure.
     if [ "$REALTIME_MODE" = true ]; then
         run_realtime_watch
+        cleanup_realtime
+        echo -e "${R}[FAIL] Real-time watch ended${Z}"
     fi
 
     rm -rf "$WORK_DIR"
@@ -4432,7 +4518,9 @@ main() {
         "$WORK_DIR"/*) : ;;
         /dev/shm/av_sigs_*) rm -rf "$SIG_DIR" 2>/dev/null ;;
     esac
-    # Exit code for cron/monitoring (H9): 0 = clean, 1 = threats found.
+    # Exit code for cron/monitoring (H9): 0 = clean, 1 = threats found,
+    # 2 = real-time watch failed.
+    [ "$REALTIME_MODE" = true ] && exit 2
     [ "${TT:-0}" -gt 0 ] && exit 1
     exit 0
 }
@@ -6396,14 +6484,20 @@ _flush_batches() {
 }
 
 run_scan_loop() {
-    local col1 col2 col3 file size oct magic_type skip_deep ext rc line pending="" r
+    local col1 col2 col3 file size oct magic_type skip_deep ext rc line pending="" r t0=""
 
     while :; do
         IFS= read -r -t 2 line; rc=$?
         # >128 = read timed out (idle FIFO in -w mode): keep any partial
         # line (bash stores it in $line), flush batches, keep waiting.
-        if [ "$rc" -gt 128 ]; then pending+="$line"; _flush_batches; continue; fi
+        if [ "$rc" -gt 128 ]; then pending+="$line"; _flush_batches; t0=""; continue; fi
         line="$pending$line"; pending=""
+        # -w: a steady trickle (<2 s apart) never times out the read, so
+        # also flush once the oldest queued path is 2 s old.
+        if [ "$WORKER_ID" = "rt" ]; then
+            if [ -n "$t0" ] && [ $(( SECONDS - t0 )) -ge 2 ]; then _flush_batches; t0=""; fi
+            [ -z "$t0" ] && t0=$SECONDS
+        fi
         [ "$rc" -ne 0 ] && [ -z "$line" ] && break
         # Pool line is "size<TAB>mode<TAB>path" or just "path".
         if [[ "$line" == *$'\t'*$'\t'* ]]; then
