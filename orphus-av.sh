@@ -342,7 +342,7 @@ export LC_ALL=C
 # 1. GLOBALS — all script variables defined once here, before any code uses
 #    them. init_*/detect_* functions and parse_args() fill in real values.
 # ============================================================================
-VERSION="0.3.1"
+VERSION="0.3.2"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Re-exec into our OWN bundled bash (see build_bash_from_source /
