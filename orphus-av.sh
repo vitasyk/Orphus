@@ -25,15 +25,23 @@
 #   -u, --update            Update signatures and EXIT (no auto-scan after)
 #   -r, --max-ram MB        Max RAM limit in megabytes (default: 500)
 #   -j, --workers N         Number of parallel worker processes (default: auto)
-#   -d, --dir PATH          Target directory to scan (default: /mnt)
+#   -d, --dir PATH          Target directory to scan (default: /mnt). Must
+#                            exist (else exit 2); a symlinked dir (e.g.
+#                            www -> public_html) is scanned at its real
+#                            path. Relative paths in -d/-s/-o/-X/
+#                            --quarantine-dir are made absolute.
 #   -s, --sigs PATH         Signature directory (default: ./signatures)
-#   -m, --max-size MB       Max file size for deep inspection in MB (default: 10)
+#   -m, --max-size MB       Max file size for deep inspection in MB (default: 50)
+#                            Numeric options take whole numbers only
+#                            (no "10M", "1.5", "1e3"); anything else -> exit 2.
 #   -o, --output FILE       Report file. Written to LIVE as threats are
 #                            found (not just at the end) — if the scan gets
 #                            interrupted, whatever's in this file up to
 #                            that point is still valid. Without -o, a
-#                            default ./av_scan_threats_<timestamp>.log is
-#                            used automatically (never silently discarded).
+#                            default <script dir>/reports/
+#                            av_scan_threats_<timestamp>_<pid>.log is used
+#                            (never the current dir, never silently
+#                            discarded). A symlinked -o is refused.
 #                            SUID/SGID findings are written to a SEPARATE
 #                            companion file (same name + "-SUID") instead
 #                            of mixed into this one — on a full-OS scan,
@@ -264,6 +272,10 @@
 #   --check-deps             Print bundled/system/missing status for
 #                            busybox and yara/yarac, then exit
 #   -h, --help               Show this help (also runs --check-deps)
+#
+# Exit codes: 0 = clean, 1 = threats found, 2 = error (bad option, missing
+#   -d, ...) or scan incomplete (a worker died before finishing its files;
+#   reported only when no threats were found — 1 wins), 130 = interrupted.
 #
 # File layout:
 #   1. GLOBALS         — all script variables, defined once here
@@ -618,6 +630,7 @@ TF=0            # files scanned (total across workers)
 TT=0            # threats found (total across workers)
 QC=0            # quarantined (total across workers)
 SC=0            # suppressed by ignore_sigs (total across workers)
+UNFINISHED=0    # workers that exited without writing their .done marker
 SPEED=0
 RPT=""          # final report text
 
@@ -695,7 +708,7 @@ verify_pinned() {
 }
 
 net_fetch() {
-    # Downloader chain: busybox wget -> system wget -> system curl.
+    # Downloader chain: system wget -> system curl -> busybox wget.
     # Optional 4th arg is a User-Agent (e.g. for the ClamAV mirror).
     # Optional 5th arg is a max expected size in MB (default 300 — generous
     # enough for every real thing this script downloads: main.cvd at
@@ -745,14 +758,12 @@ net_fetch() {
         [ -n "$sz" ] && [ "$sz" -lt "$max_bytes" ]
     }
 
-    if [ -n "$BUSYBOX_BIN" ] && "$BUSYBOX_BIN" wget --help &>/dev/null 2>&1; then
-        if [ -n "$ua" ]; then
-            "$BUSYBOX_BIN" wget -q -T "$timeout" -U "$ua" -O "$dest" "$url" 2>/dev/null
-        else
-            "$BUSYBOX_BIN" wget -q -T "$timeout" -O "$dest" "$url" 2>/dev/null
-        fi
-        if _fetch_size_ok "$dest"; then return 0; else rm -f "$dest" 2>/dev/null; fi
-    fi
+    # Order: system wget -> system curl -> bundled busybox wget LAST. The
+    # pinned busybox 1.35 wget does not validate TLS certificates (its
+    # binary says "TLS certificate validation not implemented"), so it
+    # only runs when neither system tool exists. --tries=2 (GNU default is
+    # 20 retries) and curl's --speed-limit/--max-time keep a stalled
+    # server from hanging a cron run forever.
     if command -v wget &>/dev/null; then
         # FIX (real bug reported): -Q/--quota was added here for a
         # size cap, but wget's OWN documented behavior is that quota does
@@ -765,9 +776,9 @@ net_fetch() {
         # post-download size check below is the real, verified
         # protection regardless of which tool ran.
         if [ -n "$ua" ]; then
-            wget -q --timeout="$timeout" -U "$ua" -O "$dest" "$url" 2>/dev/null
+            wget -q --tries=2 --timeout="$timeout" -U "$ua" -O "$dest" "$url" 2>/dev/null
         else
-            wget -q --timeout="$timeout" -O "$dest" "$url" 2>/dev/null
+            wget -q --tries=2 --timeout="$timeout" -O "$dest" "$url" 2>/dev/null
         fi
         if _fetch_size_ok "$dest"; then return 0; else rm -f "$dest" 2>/dev/null; fi
     fi
@@ -783,9 +794,18 @@ net_fetch() {
         # (including its own edge case — see the comment on it above),
         # so that's what all three downloaders rely on uniformly now.
         if [ -n "$ua" ]; then
-            curl -fsSL -A "$ua" --connect-timeout "$timeout" -o "$dest" "$url" 2>/dev/null
+            curl -fsSL -A "$ua" --connect-timeout "$timeout" --speed-limit 1024 --speed-time 60 --max-time 1800 -o "$dest" "$url" 2>/dev/null
         else
-            curl -fsSL --connect-timeout "$timeout" -o "$dest" "$url" 2>/dev/null
+            curl -fsSL --connect-timeout "$timeout" --speed-limit 1024 --speed-time 60 --max-time 1800 -o "$dest" "$url" 2>/dev/null
+        fi
+        if _fetch_size_ok "$dest"; then return 0; else rm -f "$dest" 2>/dev/null; fi
+    fi
+    if [ -n "$BUSYBOX_BIN" ] && "$BUSYBOX_BIN" wget --help &>/dev/null 2>&1; then
+        case "$url" in https://*) echo -e "${Y}[WARN] No system wget/curl -> busybox wget, which does NOT verify TLS certificates: $url${Z}" >&2 ;; esac
+        if [ -n "$ua" ]; then
+            "$BUSYBOX_BIN" wget -q -T "$timeout" -U "$ua" -O "$dest" "$url" 2>/dev/null
+        else
+            "$BUSYBOX_BIN" wget -q -T "$timeout" -O "$dest" "$url" 2>/dev/null
         fi
         if _fetch_size_ok "$dest"; then return 0; else rm -f "$dest" 2>/dev/null; fi
     fi
@@ -852,8 +872,14 @@ verify_busybox_binary() {
     if [ "$OS" = "macos" ]; then sz=$(stat -f '%z' "$c" 2>/dev/null)
     else sz=$(stat -c '%s' "$c" 2>/dev/null); fi
     { [ -n "$sz" ] && [ "$sz" -ge 400000 ] && [ "$sz" -le 3000000 ]; } || return 1
-    "$c" --help 2>&1 | head -1 | grep -qi "busybox" || return 1
-    return 0
+    # Captured, not piped into head/grep: under set -o pipefail an early
+    # pipe close can SIGPIPE busybox and fail this check on a good binary.
+    local out
+    out=$("$c" --help 2>&1)
+    case "${out%%$'\n'*}" in
+        *[Bb][Uu][Ss][Yy][Bb][Oo][Xx]*) return 0 ;;
+    esac
+    return 1
 }
 
 find_local_busybox() {
@@ -877,16 +903,21 @@ download_busybox() {
     case "$url" in
         https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox) key="busybox-1.35.0-x86_64" ;;
     esac
+    # Downloaded to "$dest.new" and moved into place only after both
+    # checks pass — a failed/offline download must never delete an
+    # existing bin/busybox.
+    local tmp="$dest.new"
     mkdir -p "$SCRIPT_DIR/bin"
+    rm -f "$tmp" 2>/dev/null
     echo -e "${C}[*] BusyBox not found locally -> auto-downloading (~1MB)...${Z}"
-    net_fetch "$url" "$dest" 15 "" 10
+    net_fetch "$url" "$tmp" 15 "" 10
     # An internal mirror (--busybox-url) serving the same binary is fine.
-    [ "$(sha256sum "$dest" 2>/dev/null | cut -d' ' -f1)" = "$(_pinned_sha256 busybox-1.35.0-x86_64)" ] && key="busybox-1.35.0-x86_64"
+    [ "$(sha256sum "$tmp" 2>/dev/null | cut -d' ' -f1)" = "$(_pinned_sha256 busybox-1.35.0-x86_64)" ] && key="busybox-1.35.0-x86_64"
     # Hash first: never execute (--help check below) an unverified binary.
-    verify_pinned "$dest" "$key" || { rm -f "$dest" 2>/dev/null; return 1; }
-    chmod +x "$dest" 2>/dev/null
-    verify_busybox_binary "$dest" || { rm -f "$dest" 2>/dev/null; echo -e "${R}[FAIL] BusyBox download/verify failed${Z}"; return 1; }
-    chmod +x "$dest" 2>/dev/null
+    verify_pinned "$tmp" "$key" || { rm -f "$tmp" 2>/dev/null; return 1; }
+    chmod +x "$tmp" 2>/dev/null
+    verify_busybox_binary "$tmp" || { rm -f "$tmp" 2>/dev/null; echo -e "${R}[FAIL] BusyBox download/verify failed${Z}"; return 1; }
+    mv -f "$tmp" "$dest" || { rm -f "$tmp" 2>/dev/null; return 1; }
     echo -e "${G}[OK] busybox saved: $dest${Z}"
     BUSYBOX_BIN="$dest"
     return 0
@@ -1537,7 +1568,7 @@ parse_args() {
             --clam-windows)      CLAM_WINDOWS=true; shift ;;
             --clamd)             CLAMD_SCAN=true; shift ;;
             --deep|--paranoid)   SUID_VERIFY_MODE=true; SCAN_ARCHIVES=true; DEEP_MODE=true
-                                 # Real gap found: the default 10MB deep-
+                                 # Real gap found: the default 50MB deep-
                                  # inspection cap (hash/YARA/strings ALL
                                  # gated on it) silently skipped files
                                  # like /var/lib/clamav/main.cvd (89MB) —
@@ -1583,6 +1614,95 @@ parse_args() {
             *) echo "Unknown parameter: $1"; exit 1 ;;
         esac
     done
+}
+
+# _abs_path PATH -> absolute, repeated/trailing "/" removed ("/" stays "/"),
+# "."/".." resolved logically (like cd) for the part that exists. The
+# self-exclusions in collect_files() are string matches (find -path), so
+# "-d .", "-X cache/" or a relative --quarantine-dir never matched before.
+_abs_path() {
+    local p="$1" d b
+    case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+    p=$(printf '%s' "$p" | tr -s '/')
+    [ "$p" != "/" ] && p="${p%/}"
+    if [ -d "$p" ]; then
+        d=$(cd "$p" 2>/dev/null && pwd) && p="$d"
+    else
+        d="${p%/*}"; b="${p##*/}"
+        if [ -d "${d:-/}" ] && d=$(cd "${d:-/}" 2>/dev/null && pwd); then
+            if [ "$d" = "/" ]; then p="/$b"; else p="$d/$b"; fi
+        fi
+    fi
+    printf '%s\n' "$p"
+}
+
+# _phys_path PATH -> same path with symlinks in it resolved (if it exists).
+# Used for the scan root (find does not descend into a symlinked root, and
+# its output prefix must match the exclusions) and the exclusion list.
+_phys_path() {
+    local p="$1" d
+    if [ -d "$p" ]; then
+        d=$(cd -P "$p" 2>/dev/null && pwd -P) && p="$d"
+    elif [ -e "$p" ] || [ -L "$p" ]; then
+        if d=$(cd -P "${p%/*}/" 2>/dev/null && pwd -P); then
+            if [ "$d" = "/" ]; then p="/${p##*/}"; else p="$d/${p##*/}"; fi
+        fi
+    fi
+    printf '%s\n' "$p"
+}
+
+# Runs right after parse_args: rejects bad numeric options and unusable
+# paths up front (exit 2) instead of a worker dying on bash arithmetic
+# mid-scan and the run still ending "[OK] No threats detected" exit 0.
+normalize_args() {
+    local spec opt name min val
+    if [[ "$SCRIPT_DIR" == *[[:space:]]* ]]; then
+        echo -e "${R}[FAIL] Install path contains whitespace: '$SCRIPT_DIR' — move the scanner to a path without spaces (tool commands like \"\$SCRIPT_DIR/bin/yara\" are word-split)${Z}" >&2
+        exit 2
+    fi
+    if [[ "$BUSYBOX_PATH_ARG" == *[[:space:]]* ]]; then
+        echo -e "${R}[FAIL] -b/--busybox path contains whitespace: '$BUSYBOX_PATH_ARG'${Z}" >&2
+        exit 2
+    fi
+    # option:VARIABLE:minimum — whole decimal numbers only (bash arithmetic
+    # rejects "1.5"/"10M"; "1e3" or "08" would be misread), at most 9 digits.
+    for spec in -r:MAX_RAM_MB:1 -j:WORKERS:1 -m:MAX_SCAN_MB:1 \
+                --archive-max-mb:ARCHIVE_MAX_MB:1 --archive-ram-max-mb:ARCHIVE_RAM_MAX_MB:0 \
+                --archive-max-extract-mb:ARCHIVE_MAX_EXTRACT_MB:1 --archive-max-depth:ARCHIVE_MAX_DEPTH:0 \
+                --archive-max-files:ARCHIVE_MAX_FILES:1 --yara-timeout:YARA_TIMEOUT_SEC:1 \
+                --long-time-threshold:LONG_TIME_THRESHOLD_SEC:0 --quarantine-max:QUARANTINE_MAX:0 \
+                --watch-interval:WATCH_INTERVAL:1 --max-hex-patterns:MAX_HEX_PATTERNS:0 \
+                --batch-size:BATCH_SIZE:1 --heur-batch-size:HEUR_BATCH_SIZE:1 --pe-batch-size:PE_BATCH_SIZE:1; do
+        opt="${spec%%:*}"; name="${spec#*:}"; min="${name#*:}"; name="${name%:*}"
+        val="${!name}"
+        [ "$name" = WORKERS ] && [ -z "$WORKERS_EXPLICIT" ] && continue
+        if ! [[ "$val" =~ ^[0-9]{1,9}$ ]] || [ $(( 10#$val )) -lt "$min" ]; then
+            echo -e "${R}[FAIL] $opt: '$val' is not a whole number >= $min${Z}" >&2
+            exit 2
+        fi
+        printf -v "$name" '%d' "$(( 10#$val ))"
+    done
+
+    if [ -z "$ROOT_DIR" ]; then
+        echo -e "${R}[FAIL] -d: empty path${Z}" >&2; exit 2
+    fi
+    ROOT_DIR=$(_abs_path "$ROOT_DIR")
+    if [ -e "$ROOT_DIR" ]; then
+        ROOT_DIR=$(_phys_path "$ROOT_DIR")
+    elif [ -n "$ROOT_DIR_EXPLICIT" ] || { [ "$DO_UPDATE" != true ] && [ "$DO_SETUP" != true ] \
+            && [ "$DO_CHECK_DEPS" != true ] && [ -z "$RESTORE_ARG" ] \
+            && [ "$SCAN_PROCESSES" != true ] && [ "$CHECK_KERNEL" != true ]; }; then
+        echo -e "${R}[FAIL] Scan target does not exist: $ROOT_DIR (-d)${Z}" >&2
+        exit 2
+    fi
+    SIGNATURES=$(_abs_path "$SIGNATURES")
+    QUARANTINE_DIR=$(_abs_path "$QUARANTINE_DIR")
+    [ -n "$OUTPUT_FILE" ] && OUTPUT_FILE=$(_abs_path "$OUTPUT_FILE")
+    local i
+    for i in "${!EXCLUDE_PATHS[@]}"; do
+        [ -n "${EXCLUDE_PATHS[$i]}" ] && EXCLUDE_PATHS[$i]=$(_abs_path "${EXCLUDE_PATHS[$i]}")
+    done
+    return 0
 }
 
 setup_colors() {
@@ -1823,10 +1943,34 @@ EOF
 # interrupted scan still leaves usable results behind instead of losing
 # everything found up to that point.
 init_live_report() {
+    local f dir
     if [ -n "$OUTPUT_FILE" ]; then
+        # Root writing through a planted symlink (e.g. -> /etc/shadow)
+        # would truncate/append to the target.
+        for f in "$OUTPUT_FILE" "${OUTPUT_FILE}-SUID" "${OUTPUT_FILE}.slow"; do
+            if [ -L "$f" ]; then
+                echo -e "${R}[FAIL] -o: refusing to write through a symlink: $f${Z}" >&2
+                exit 2
+            fi
+        done
         LIVE_REPORT_FILE="$OUTPUT_FILE"
     else
-        LIVE_REPORT_FILE="$(pwd)/av_scan_threats_$(date +%Y%m%d_%H%M%S 2>/dev/null || echo "$$").log"
+        # Not the current dir: a docroot cwd let old reports (full of
+        # matched malware strings) get scanned/quarantined next run, and a
+        # planted symlink there got truncated. reports/ is private (0700,
+        # ours, not a symlink) and under SCRIPT_DIR, so self-excluded.
+        dir="$SCRIPT_DIR/reports"
+        mkdir -p -m 700 "$dir" 2>/dev/null
+        if [ -L "$dir" ] || [ ! -d "$dir" ] || [ ! -O "$dir" ] || [ ! -w "$dir" ]; then
+            dir=$(mktemp -d "${TMPDIR:-/tmp}/orphus_reports.XXXXXX" 2>/dev/null) || dir=""
+        fi
+        LIVE_REPORT_FILE="${dir:-/nonexistent}/av_scan_threats_$(date +%Y%m%d_%H%M%S 2>/dev/null)_$$.log"
+        # noclobber = O_EXCL for a new file: never opens an existing path.
+        if ! ( set -C; : > "$LIVE_REPORT_FILE" ) 2>/dev/null; then
+            echo -e "${Y}[WARN] Can't create ${LIVE_REPORT_FILE} -> live threat log disabled (results only available at the end)${Z}"
+            LIVE_REPORT_FILE=""
+            return 0
+        fi
     fi
     # SUID/SGID findings go to their own companion file — on a full-OS
     # deep scan, standard system binaries (passwd/sudo/su/mount/etc, and
@@ -3751,7 +3895,12 @@ update_incremental_cache() {
 
 collect_files() {
     echo -e "[*] Collecting file tree..."
-    local excl=(-not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*")
+    # Excluded paths are PRUNED (find never descends into them) instead of
+    # walked and filtered with -not -path — same file list, but /proc,
+    # /sys, the quarantine dir and big -X trees are no longer traversed.
+    # Each path P matches as "P" and "P/*" (the latter also covers a scan
+    # root that is itself inside an excluded tree).
+    local prune=(/proc /sys /dev)
 
     # Always exclude the scanner's own footprint (install dir, signature
     # dir, quarantine dir, ephemeral work dir, live report file) —
@@ -3776,17 +3925,26 @@ collect_files() {
     local self_paths=("$SCRIPT_DIR" "$SIGNATURES" "$WORK_DIR" "$SIG_DIR")
     [ "$QUARANTINE_ENABLED" = true ] && self_paths+=("$QUARANTINE_DIR")
     local p
-    for p in "${self_paths[@]}"; do
-        [ -n "$p" ] && excl+=(-not -path "$p" -not -path "${p}/*")
-    done
+    # Report files (and their -SUID/.slow siblings) when -o points into
+    # the scanned tree; then user -X/--exclude paths (repeatable).
     for p in "$LIVE_REPORT_FILE" "$OUTPUT_FILE"; do
-        [ -n "$p" ] && excl+=(-not -path "$p")
+        [ -n "$p" ] && self_paths+=("$p" "$p-SUID" "$p.slow")
     done
-
-    # User-specified extra exclusions (-X/--exclude, repeatable)
-    for p in "${EXCLUDE_PATHS[@]}"; do
-        [ -n "$p" ] && excl+=(-not -path "$p" -not -path "${p}/*")
+    self_paths+=("${EXCLUDE_PATHS[@]}")
+    local q excl=(\()
+    for p in "${self_paths[@]}"; do
+        [ -n "$p" ] || continue
+        # ROOT_DIR is a physical path (normalize_args), so find prints
+        # physical paths: also exclude each path's symlink-resolved form
+        # (e.g. scanner installed under www -> public_html).
+        prune+=("$p")
+        q=$(_phys_path "$p"); [ "$q" != "$p" ] && prune+=("$q")
     done
+    for p in "${prune[@]}"; do
+        [ "${#excl[@]}" -gt 1 ] && excl+=(-o)
+        excl+=(-path "$p" -o -path "${p%/}/*")
+    done
+    excl+=(\) -prune -o)
 
     # FIX (real bug found, pre-existing — not introduced by incremental
     # mode): this printf-capability check used to go through bb() (which
@@ -3811,14 +3969,14 @@ collect_files() {
         # Third field is the incremental-cache key: ctime:dev:inode, not
         # mtime — mtime is forgeable with `touch -r` after editing (H4),
         # ctime is not settable by an unprivileged user.
-        command find "$ROOT_DIR" -type f "${excl[@]}" -printf "%s\t%m\t%C@:%D:%i\t%p\n" 2>/dev/null > "$WORK_DIR/all_files_raw.tsv"
+        command find -H "$ROOT_DIR" "${excl[@]}" -type f -printf "%s\t%m\t%C@:%D:%i\t%p\n" 2>/dev/null > "$WORK_DIR/all_files_raw.tsv"
         apply_incremental_filter
     else
         # No printf-capable find available (BSD find on macOS, or no
         # system find at all) — incremental mode has no effect on this
         # path, every file is always scanned (correct, just not
         # IOPS-optimized here).
-        bb find "$ROOT_DIR" -type f "${excl[@]}" -print 2>/dev/null > "$WORK_DIR/all_files.tsv"
+        bb find -H "$ROOT_DIR" "${excl[@]}" -type f -print 2>/dev/null > "$WORK_DIR/all_files.tsv"
         SKIPPED_UNCHANGED=0
     fi
     TOTAL_FILES=$(bb wc -l < "$WORK_DIR/all_files.tsv" | tr -d ' ')
@@ -3870,7 +4028,7 @@ collect_files() {
     # output was truncated right at that byte (missing the rest of the
     # name and the NUL terminator), while system find handled the same
     # file correctly. Using busybox here would defeat the whole point.
-    done < <(command find "$ROOT_DIR" -type f "${excl[@]}" -print0 2>/dev/null)
+    done < <(command find -H "$ROOT_DIR" "${excl[@]}" -type f -print0 2>/dev/null)
 }
 
 split_pools() {
@@ -4106,6 +4264,24 @@ build_report() {
     SC=$(count_suppressed)
     SPEED=0; [ "$ELAPSED_S" -gt 0 ] && SPEED=$(( TF / ELAPSED_S ))
 
+    # A worker that died (crash, OOM kill, bash error) never writes its
+    # .done marker: its share of files went unscanned, so this run must
+    # not print CLEAN / exit 0 (main exits 2). Fewer files scanned than
+    # queued WITHOUT a dead worker is normal (files deleted or unreadable
+    # since collection, e.g. cache/session files) -> note only.
+    UNFINISHED=0
+    for r in "$WORK_DIR/reports"/pool_*.txt; do
+        [ -f "$r" ] && [ ! -f "${r%.txt}.done" ] && UNFINISHED=$(( UNFINISHED + 1 ))
+    done
+    local incomplete_line=""
+    if [ "$UNFINISHED" -gt 0 ]; then
+        incomplete_line="
+ INCOMPLETE         : $UNFINISHED worker(s) died — only $TF of ${TOTAL_FILES:-0} queued files scanned"
+    elif [ "$TF" -lt "${TOTAL_FILES:-0}" ] 2>/dev/null; then
+        incomplete_line="
+ Not scanned        : $(( TOTAL_FILES - TF )) of $TOTAL_FILES queued (gone or unreadable when reached)"
+    fi
+
     QC=0
     [ "$QUARANTINE_ENABLED" = true ] && QC=$(count_quarantined)
     local quarantine_line=""
@@ -4142,7 +4318,7 @@ build_report() {
 =================================================
  OS / Arch          : $OS / $ARCH
  Target             : $ROOT_DIR
- Files Scanned      : $TF
+ Files Scanned      : $TF${incomplete_line}
  Threats Found      : $TT${quarantine_line}${suppressed_line}${skipped_line}
  Time Elapsed       : $(printf '%02d:%02d' $(( ELAPSED_S/60 )) $(( ELAPSED_S%60 )))
  Avg Speed          : ${SPEED} files/s
@@ -4166,9 +4342,15 @@ print_report() {
         if [ "${suid_count:-0}" -gt 0 ]; then
             echo -e "\n ${Y}[i]${Z} ${suid_count} SUID/SGID finding(s) written separately to: ${C}${SUID_REPORT_FILE}${Z}"
         fi
+    elif [ "${UNFINISHED:-0}" -gt 0 ]; then
+        echo -e "${Y}${RPT}${Z}"
+        echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${UNFINISHED} worker(s) died before finishing — NOT a clean result (exit 2)${Z}"
     else
         echo -e "${G}${RPT}${Z}"
         echo -e "\n ${G}[OK] No threats detected [CLEAN]${Z}"
+    fi
+    if [ "$TT" -gt 0 ] && [ "${UNFINISHED:-0}" -gt 0 ]; then
+        echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${UNFINISHED} worker(s) died before finishing${Z}"
     fi
 }
 
@@ -4327,6 +4509,7 @@ run_realtime_watch() {
 main() {
     detect_platform
     parse_args "$@"
+    normalize_args
     setup_colors
     apply_low_priority
 
@@ -4364,7 +4547,18 @@ main() {
         extract_setup_module
         local setup_args=()
         [ "${SETUP_FORCE:-false}" = true ] && setup_args+=(--force)
-        "$WORKER_BASH" "$SCRIPT_DIR/setup_module.sh" "${setup_args[@]}"
+        # The module is a fresh bash: options reach it only via env.
+        YARA_URL_ARG="$YARA_URL_ARG" YARA_URL_SHA256="$YARA_URL_SHA256" \
+        SETUP_COMPILE_ONLY="$SETUP_COMPILE_ONLY" ALLOW_BUSYBOX="$ALLOW_BUSYBOX" \
+        BUSYBOX_URL_ARG="$BUSYBOX_URL_ARG" BUSYBOX_PATH_ARG="$BUSYBOX_PATH_ARG" \
+            # The module is a separate bash process and reads these from its
+        # environment — without them --yara-url/--compile/--no-busybox/
+        # --busybox-url/-b were silently ignored.
+        YARA_URL_ARG="$YARA_URL_ARG" YARA_URL_SHA256="$YARA_URL_SHA256" \
+        SETUP_FORCE="$SETUP_FORCE" SETUP_COMPILE_ONLY="$SETUP_COMPILE_ONLY" \
+        ALLOW_BUSYBOX="$ALLOW_BUSYBOX" BUSYBOX_URL_ARG="$BUSYBOX_URL_ARG" \
+        BUSYBOX_PATH_ARG="$BUSYBOX_PATH_ARG" \
+            "$WORKER_BASH" "$SCRIPT_DIR/setup_module.sh" "${setup_args[@]}"
         exit $?
     fi
 
@@ -4505,8 +4699,10 @@ main() {
         "$WORK_DIR"/*) : ;;
         /dev/shm/av_sigs_*) rm -rf "$SIG_DIR" 2>/dev/null ;;
     esac
-    # Exit code for cron/monitoring (H9): 0 = clean, 1 = threats found.
+    # Exit code for cron/monitoring (H9): 0 = clean, 1 = threats found,
+    # 2 = scan incomplete (a worker died; threats take precedence).
     [ "${TT:-0}" -gt 0 ] && exit 1
+    [ "${UNFINISHED:-0}" -gt 0 ] && exit 2
     exit 0
 }
 
