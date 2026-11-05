@@ -2239,6 +2239,12 @@ run_awk_parallel() {
         local i
         for i in $(seq 1 $filled); do bar="${bar}#"; done
         for i in $(seq 1 $((width - filled))); do bar="${bar}-"; done
+        # Not a terminal (cron, | tee, > log): no \r redraws, one plain line per 25%.
+        if [ ! -t 2 ]; then
+            [ $(( done * 4 / total )) -ne $(( (done - 1) * 4 / total )) ] &&
+                printf "[*] Compiled %d/%d chunks (%d%%)\n" "$done" "$total" "$percent" >&2
+            return 0
+        fi
         printf "\r[*] [%s] %3d%% (%d/%d) " "$bar" "$percent" "$done" "$total" >&2
     }
 
@@ -4119,7 +4125,7 @@ wait_for_workers() {
     local pid
     for pid in "${WORKER_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
     kill "$MONITOR_PID" 2>/dev/null || true
-    tput cnorm 2>/dev/null || true
+    [ ! -t 1 ] || tput cnorm 2>/dev/null || true  # escapes only to a terminal
 }
 
 # ============================================================================
@@ -4127,8 +4133,11 @@ wait_for_workers() {
 # ============================================================================
 show_progress() {
     local prev=0 prev_ms="$START_MS"
-    tput civis 2>/dev/null || true
-    printf '\n\n\n\n\n'
+    # Not a terminal (cron, | tee, > log): no cursor-movement panel, just a
+    # plain status line every 60 s.
+    local tty=false next_line_s=60
+    [ -t 1 ] && tty=true
+    [ "$tty" = true ] && { tput civis 2>/dev/null || true; printf '\n\n\n\n\n'; }
     while true; do
         local now elapsed_ms elapsed_s
         now=$(now_ms)
@@ -4214,6 +4223,15 @@ show_progress() {
         local efmt; efmt=$(printf '%02d:%02d' $(( elapsed_s/60 )) $(( elapsed_s%60 )))
         local tc="$G"; [ "$tt" -gt 0 ] && tc="$R"
 
+        if [ "$tty" != true ]; then
+            if [ "$elapsed_s" -ge "$next_line_s" ]; then
+                printf '[*] Progress: %d/%d files, %d threats, %s elapsed, ETA %s\n' "$tf" "${TOTAL_FILES:-0}" "$tt" "$efmt" "$eta"
+                next_line_s=$(( elapsed_s + 60 ))
+            fi
+            sleep 1
+            continue
+        fi
+
         printf '\033[5A'
         printf '\033[K'"${B}Time     :${Z} %-8s ${C}Workers : %d/%d${Z}\n" "$efmt" "$active" "$WORKERS"
         printf '\033[K'"${B}Files    :${Z} %-8d ${tc}${B}Threats : %d${Z}\n" "$tf" "$tt"
@@ -4251,7 +4269,7 @@ cleanup() {
         fi
     done
     cleanup_realtime
-    tput cnorm 2>/dev/null || true
+    [ ! -t 1 ] || tput cnorm 2>/dev/null || true  # escapes only to a terminal
 
     local found=0
     if [ -n "$LIVE_REPORT_FILE" ] && [ -f "$LIVE_REPORT_FILE" ]; then
