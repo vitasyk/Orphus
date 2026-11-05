@@ -5161,7 +5161,11 @@ init_worker_state() {
     [ -s "$SIG_DIR/mdb.tsv" ] && HAS_MDB=true
     [ -s "$SIG_DIR/str_sig_map.tsv" ] && HAS_STR_SIG_MAP=true
 
-    if [ -f "$SIG_DIR/yara/rules.yarc" ]; then
+    # Rule files without a yara binary are not YARA coverage: HAS_YARA=true
+    # here switched off the grep string pass while no YARA ever ran.
+    if [ "$YARA_CMD" = "none" ]; then
+        :
+    elif [ -f "$SIG_DIR/yara/rules.yarc" ]; then
         HAS_YARA=true; YARA_TARGET="$SIG_DIR/yara/rules.yarc"
     elif [ -f "$SIG_DIR/yara/index.yar" ]; then
         HAS_YARA=true; YARA_TARGET="$SIG_DIR/yara/index.yar"
