@@ -955,6 +955,34 @@ bb() {
     fi
 }
 
+# _hash_each <openssl-ALG|bsd-md5> [file...] — H3: openssl prints
+# "MD5(name)= hash" and "md5 -q" prints bare hashes, but the batch parsers
+# read coreutils "<hash>  <name>". Hash each file via stdin and print that
+# format, escaped like coreutils (H2). No files = hash stdin.
+_hash_each() {
+    local tool="$1" f out
+    shift
+    local -a c
+    case "$tool" in
+        bsd-md5)   c=(md5 -q) ;;
+        openssl-*) c=(openssl dgst "-${tool#openssl-}") ;;
+        *) return 1 ;;
+    esac
+    if [ $# -eq 0 ]; then
+        out=$("${c[@]}") || return 1
+        printf '%s  -\n' "${out##* }"; return
+    fi
+    for f in "$@"; do
+        out=$("${c[@]}" < "$f") || continue
+        out="${out##* }"
+        [[ "$out" =~ ^[0-9a-f]+$ ]] || continue
+        case "$f" in
+            *\\*|*$'\n'*) f="${f//\\/\\\\}"; printf '\\%s  %s\n' "$out" "${f//$'\n'/\\n}" ;;
+            *) printf '%s  %s\n' "$out" "$f" ;;
+        esac
+    done
+}
+
 # ============================================================================
 # 4. MODULE: hash & yara & strings/file detection (busybox-first)
 #    Priority: busybox applet -> system tool -> (for strings/file) our own
@@ -971,15 +999,15 @@ detect_sha256() {
     if command -v sha256sum &>/dev/null; then echo "sha256sum"
     elif [ -n "$BUSYBOX_BIN" ] && busybox_has_applet sha256sum; then echo "$BUSYBOX_BIN sha256sum"
     elif command -v shasum &>/dev/null; then echo "shasum -a 256"
-    elif command -v openssl &>/dev/null; then echo "openssl dgst -sha256"
+    elif command -v openssl &>/dev/null; then echo "_hash_each openssl-sha256"
     else echo "none"; fi
 }
 
 detect_md5() {
     if command -v md5sum &>/dev/null; then echo "md5sum"
     elif [ -n "$BUSYBOX_BIN" ] && busybox_has_applet md5sum; then echo "$BUSYBOX_BIN md5sum"
-    elif command -v md5 &>/dev/null; then echo "md5 -q"
-    elif command -v openssl &>/dev/null; then echo "openssl dgst -md5"
+    elif command -v md5 &>/dev/null; then echo "_hash_each bsd-md5"
+    elif command -v openssl &>/dev/null; then echo "_hash_each openssl-md5"
     else echo "none"; fi
 }
 
@@ -993,7 +1021,7 @@ detect_sha1() {
     if command -v sha1sum &>/dev/null; then echo "sha1sum"
     elif [ -n "$BUSYBOX_BIN" ] && busybox_has_applet sha1sum; then echo "$BUSYBOX_BIN sha1sum"
     elif command -v shasum &>/dev/null; then echo "shasum -a 1"
-    elif command -v openssl &>/dev/null; then echo "openssl dgst -sha1"
+    elif command -v openssl &>/dev/null; then echo "_hash_each openssl-sha1"
     else echo "none"; fi
 }
 
@@ -4656,6 +4684,31 @@ bb() {
         *" $applet "*) "$BUSYBOX_BIN" "$applet" "$@" ;;
         *) command "$applet" "$@" ;;
     esac
+}
+
+# Own copy of _hash_each (see main script, H3).
+_hash_each() {
+    local tool="$1" f out
+    shift
+    local -a c
+    case "$tool" in
+        bsd-md5)   c=(md5 -q) ;;
+        openssl-*) c=(openssl dgst "-${tool#openssl-}") ;;
+        *) return 1 ;;
+    esac
+    if [ $# -eq 0 ]; then
+        out=$("${c[@]}") || return 1
+        printf '%s  -\n' "${out##* }"; return
+    fi
+    for f in "$@"; do
+        out=$("${c[@]}" < "$f") || continue
+        out="${out##* }"
+        [[ "$out" =~ ^[0-9a-f]+$ ]] || continue
+        case "$f" in
+            *\\*|*$'\n'*) f="${f//\\/\\\\}"; printf '\\%s  %s\n' "$out" "${f//$'\n'/\\n}" ;;
+            *) printf '%s  %s\n' "$out" "$f" ;;
+        esac
+    done
 }
 
 # ----------------------------------------------------------------------------
