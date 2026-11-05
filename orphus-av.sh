@@ -388,6 +388,7 @@ MAX_SCAN_MB_EXPLICIT=""  # set to 1 if -m/--max-size was explicitly
                         # passed — lets --deep raise the default without
                         # overriding a person's own explicit choice
 MAX_RAM_MB=500
+MAX_RAM_MB_EXPLICIT=""  # set to 1 by -r/--max-ram: worker cuts then warn, not inform
 OUTPUT_FILE=""
 LIVE_REPORT_FILE=""    # persistent (outside WORK_DIR) file threats are
                         # appended to AS THEY'RE FOUND, so Ctrl+C/SIGTERM
@@ -931,10 +932,10 @@ ensure_busybox() {
     # fallback) means the package is damaged/incomplete, hence WARN/FAIL.
     [ "$ALLOW_BUSYBOX" = true ] || { echo -e "${Y}[INFO] BusyBox disabled (--no-busybox) -> system tools only${Z}"; return 1; }
 
-    find_local_busybox && { echo -e "${G}[OK] Local busybox: $BUSYBOX_BIN${Z}"; return 0; }
+    find_local_busybox && return 0  # the banner's "Tools" line shows the path
 
     echo -e "${R}[WARN] Expected bundled busybox not found at ${SCRIPT_DIR}/bin/busybox${Z}"
-    echo -e "${R}       This is unusual — check the package (file missing or corrupted).${Z}"
+    echo -e "${R}       This is unusual - check the package (file missing or corrupted).${Z}"
 
     if [ "$OS" = "macos" ]; then
         echo -e "${Y}[INFO] macOS: no official static busybox builds -> system tools${Z}"
@@ -1084,7 +1085,7 @@ detect_yarac() {
 }
 
 init_toolchain() {
-    echo -e "[*] Initializing toolchain..."
+    # Silent when healthy: the banner's "Tools" line lists what was picked.
     ensure_busybox
     cache_busybox_applets
 
@@ -1093,26 +1094,20 @@ init_toolchain() {
     SHA1_CMD=$(detect_sha1)
 
     if [ -n "$BUSYBOX_BIN" ] && busybox_has_applet strings; then
-        STRINGS_CMD="$BUSYBOX_BIN strings"; echo -e "${G}[OK] strings : busybox${Z}"
+        STRINGS_CMD="$BUSYBOX_BIN strings"
     elif command -v strings &>/dev/null; then
-        STRINGS_CMD="strings"; echo -e "${Y}[OK] strings : system (fallback)${Z}"
+        STRINGS_CMD="strings"
     else
-        STRINGS_CMD="bash"; echo -e "${Y}[WARN] strings : built-in bash detector${Z}"
+        STRINGS_CMD="bash"  # built-in detector, a normal fallback
     fi
 
     # "file" is not part of busybox; our own magic-bytes detector
     # (_bash_file_type, dd/od based) already covers what we need.
     FILE_CMD="bash"
-    echo -e "${G}[OK] file    : built-in magic-bytes detector${Z}"
 
-    echo -e " SHA256 : ${C}${SHA256_CMD}${Z}"
-    echo -e " MD5    : ${C}${MD5_CMD}${Z}"
-    if [ -n "$BUSYBOX_BIN" ]; then
-        echo -e " BusyBox: ${G}${BUSYBOX_BIN}${Z}"
-    else
-        echo -e " BusyBox: ${Y}not in use (system-only mode)${Z}"
-    fi
-    echo ""
+    [ "$SHA256_CMD" = none ] && echo -e "${R}[WARN] No SHA256 tool (sha256sum/shasum/openssl) -> SHA256 hash signatures are skipped${Z}"
+    [ "$MD5_CMD" = none ] && echo -e "${R}[WARN] No MD5 tool (md5sum/md5/openssl) -> MD5 hash signatures are skipped${Z}"
+    return 0
 }
 
 # ============================================================================
@@ -1584,7 +1579,7 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -u|--update)     DO_UPDATE=true; shift ;;
-            -r|--max-ram)    MAX_RAM_MB="$2"; shift 2 ;;
+            -r|--max-ram)    MAX_RAM_MB="$2"; MAX_RAM_MB_EXPLICIT=1; shift 2 ;;
             -j|--workers)    WORKERS="$2"; WORKERS_EXPLICIT=1; shift 2 ;;
             -d|--dir)        ROOT_DIR="$2"; ROOT_DIR_EXPLICIT=1; shift 2 ;;
             -s|--sigs)       SIGNATURES="$2"; shift 2 ;;
@@ -1792,16 +1787,13 @@ init_workers() {
         WORKERS=1
     fi
 
-    echo -e "${B}[*] RAM Guard: ceiling ${C}${MAX_RAM_MB} MB${Z}"
+    local want_workers="$WORKERS"
 
     if [ "$YARA_CMD" != "none" ] && [ -d "$SIGNATURES/yara" ]; then
         local est_yara_mb=120
         local max_safe=$(( MAX_RAM_MB / est_yara_mb ))
         [ "$max_safe" -lt 1 ] && max_safe=1
-        if [ "$WORKERS" -gt "$max_safe" ]; then
-            echo -e "${Y}[WARN] YARA RAM estimate: reducing workers $WORKERS -> $max_safe${Z}"
-            WORKERS=$max_safe
-        fi
+        [ "$WORKERS" -gt "$max_safe" ] && WORKERS=$max_safe
     fi
 
     # Capture the person's ORIGINAL --no-ram preference for archive
@@ -1814,12 +1806,19 @@ init_workers() {
 
     if [ "$MAX_RAM_MB" -le 512 ]; then
         USE_RAM=false
-        if [ "$WORKERS" -gt 4 ]; then
-            echo -e "${Y}[WARN] Low-RAM profile: workers reduced to 4${Z}"
-            WORKERS=4
-        fi
+        [ "$WORKERS" -gt 4 ] && WORKERS=4
     elif [ "$MAX_RAM_MB" -le 1024 ] && [ "$WORKERS" -gt 8 ]; then
         WORKERS=8
+    fi
+
+    # Fitting the DEFAULT ceiling is routine (INFO); overriding the person's own -j/-r is not (WARN).
+    if [ "$WORKERS" -lt "$want_workers" ]; then
+        local msg="workers $want_workers -> $WORKERS to fit the ${MAX_RAM_MB} MB RAM ceiling (raise with -r)"
+        if [ -n "$WORKERS_EXPLICIT$MAX_RAM_MB_EXPLICIT" ]; then
+            echo -e "${Y}[WARN] RAM guard: $msg${Z}"
+        else
+            echo -e "[INFO] RAM guard: $msg"
+        fi
     fi
 }
 
@@ -1865,15 +1864,15 @@ init_ignore_sigs() {
     if [ ! -f "$IGNORE_SIGS_FILE" ]; then
         mkdir -p "$(dirname "$IGNORE_SIGS_FILE")" 2>/dev/null
         cat << 'EOF' > "$IGNORE_SIGS_FILE" 2>/dev/null
-# Oprhus AV Scanner — ignore_sigs
+# Orphus AV Scanner - ignore_sigs
 #
 # One extended-regex (ERE) pattern per line, matched against
 # "TYPE|info|FILEPATH" of each detection, e.g.:
 #   YARA_MATCH|rule=WEBSHELL_PHP_Dynamic_Big|/home/site/upload/engine/init.php
-# A match SUPPRESSES that detection entirely — no log entry, no
+# A match SUPPRESSES that detection entirely - no log entry, no
 # quarantine. Patterns match as substrings anywhere on the line, so a
 # bare "rule=WEBSHELL_PHP_Dynamic_Big" suppresses that rule EVERYWHERE,
-# on every file, on every future scan — including a real webshell on some
+# on every file, on every future scan - including a real webshell on some
 # other site that happens to trip the same rule. Prefer scoping to a path
 # too, e.g. "rule=WEBSHELL_PHP_Dynamic_Big.*/upload/engine/" only
 # suppresses it under that one directory, leaving the rule fully active
@@ -1881,22 +1880,22 @@ init_ignore_sigs() {
 #
 # Use this for signatures/rules that are individually too broad for your
 # specific software (e.g. a CMS that ships obfuscated/encoded core files
-# for license protection — generic webshell-obfuscation heuristics can't
+# for license protection - generic webshell-obfuscation heuristics can't
 # tell that apart from an actual backdoor by pattern alone).
 #
-# Active by default (not commented out) — affects virtually anyone
+# Active by default (not commented out) - affects virtually anyone
 # scanning system binaries, not specific to any one server: the real
 # /usr/sbin/chroot binary (and its snap-packaged duplicates under
 # /snap/core*/*/usr/sbin/chroot) contains the literal string "/bin/sh -i"
 # as part of its own internal fallback-shell logic, not because it's
-# compromised. Scoped to paths ending in /sbin/chroot specifically — the
+# compromised. Scoped to paths ending in /sbin/chroot specifically - the
 # same pattern text on any OTHER file still triggers normally.
 pattern=/bin/sh -i.*/sbin/chroot$
 #
 # Same class of false positive, different universal system file: the
 # netcat-openbsd manual page (/usr/share/man/man1/nc_openbsd.1.gz)
 # documents "-e /bin/sh -i"-style usage examples as part of explaining
-# what the flag does — text content, not an actual reverse shell.
+# what the flag does - text content, not an actual reverse shell.
 # Present on any Debian/Ubuntu box with netcat-openbsd installed.
 pattern=/bin/sh -i.*nc_openbsd\.1\.gz$
 #
@@ -1929,12 +1928,12 @@ init_vendor_obfuscation_allowlist() {
     if [ ! -f "$GENERIC_OBFUSCATION_RULES_FILE" ]; then
         mkdir -p "$(dirname "$GENERIC_OBFUSCATION_RULES_FILE")" 2>/dev/null
         cat << 'EOF' > "$GENERIC_OBFUSCATION_RULES_FILE" 2>/dev/null
-# Oprhus AV Scanner — generic_obfuscation_rules
+# Orphus AV Scanner - generic_obfuscation_rules
 #
 # One ERE pattern per line, matched against a YARA rule NAME. These are
 # rules broad/generic enough ("does this look obfuscated at all") that
 # they can't tell a real backdoor apart from a vendor obfuscating their
-# OWN code (license protection etc) — a match against one of these rule
+# OWN code (license protection etc) - a match against one of these rule
 # names is only auto-suppressed if the SAME file also matches a
 # fingerprint in known_vendor_obfuscation (both conditions required, not
 # either alone). Add more rule names here as you find other overly-broad
@@ -1953,24 +1952,24 @@ EOF
     if [ ! -f "$KNOWN_VENDOR_OBFUSCATION_FILE" ]; then
         mkdir -p "$(dirname "$KNOWN_VENDOR_OBFUSCATION_FILE")" 2>/dev/null
         cat << 'EOF' > "$KNOWN_VENDOR_OBFUSCATION_FILE" 2>/dev/null
-# Oprhus AV Scanner — known_vendor_obfuscation
+# Orphus AV Scanner - known_vendor_obfuscation
 #
-# One ERE pattern per line — a distinctive fingerprint of a SPECIFIC,
+# One ERE pattern per line - a distinctive fingerprint of a SPECIFIC,
 # LEGITIMATE vendor's own code-obfuscation scheme (usually license
 # protection on core files, not malware). Only consulted for files that
-# ALSO matched a rule listed in generic_obfuscation_rules — this file
+# ALSO matched a rule listed in generic_obfuscation_rules - this file
 # alone never suppresses anything by itself. Add a new line per vendor
 # you run into, ideally a string unlikely to appear by accident.
 #
-# NOTE: grep matches line-by-line — "." does NOT cross newlines here, so
+# NOTE: grep matches line-by-line - "." does NOT cross newlines here, so
 # a pattern spanning e.g. a header comment AND a decode call several
 # lines later (real files have a large base64 blob in between) will never
 # match. Keep each pattern to something that appears on ONE line.
 #
-# DataLife Engine (dle-news.ru) — confirmed from real obfuscated core
+# DataLife Engine (dle-news.ru) - confirmed from real obfuscated core
 # files: a "base64_decode" spelled backwards and un-reversed via strrev()
 # at decode time (a deliberate trick to dodge naive "eval(base64_decode"
-# string signatures — which is also exactly why our OWN eval(base64_decode
+# string signatures - which is also exactly why our OWN eval(base64_decode
 # heuristic never caught it either, for what it's worth). Distinctive
 # enough on its own without needing to also match the header line.
 strrev\('edoced_46esab'\)
@@ -2027,7 +2026,7 @@ init_live_report() {
     fi
 
     {
-        echo "# Oprhus AV Scanner — live threat log (updated as threats are found)"
+        echo "# Orphus AV Scanner - live threat log (updated as threats are found)"
         echo "# Target: $ROOT_DIR"
         echo "# Started: $(date 2>/dev/null || echo unknown)"
         echo "# If this scan gets interrupted, whatever is below this line is still valid."
@@ -4493,7 +4492,7 @@ save_report() {
     # actually anything to put in it (no empty companion file otherwise).
     if bb grep -q "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null; then
         {
-            echo "# Oprhus AV Scanner — SUID/SGID findings (split out from the main report)"
+            echo "# Orphus AV Scanner - SUID/SGID findings (split out from the main report)"
             echo "# Target: $ROOT_DIR"
             echo ""
             bb grep -h "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | cut -d: -f2- | bb sort -u
