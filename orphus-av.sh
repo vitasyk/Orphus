@@ -2581,7 +2581,7 @@ EOF
                 nsub = n - 3
                 for (k = 0; k < nsub; k++) {
                     ss = a[k + 4]; mods = ""; off = "*"
-                    if (ss ~ /\// || ss ~ /#/ || ss ~ /\$\{/) { bad = "ldb_pcre_bytecmp_macro"; break }
+                    if (ss ~ /\// || ss ~ /#/ || index(ss, "${")) { bad = "ldb_pcre_bytecmp_macro"; break }
                     p = index(ss, "::")
                     if (p) { mods = substr(ss, p + 2); ss = substr(ss, 1, p - 1) }
                     p = index(ss, ":")
