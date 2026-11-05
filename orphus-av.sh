@@ -3470,11 +3470,30 @@ scan_kernel_integrity() {
     # rootkit module) are reported separately as lower-confidence
     # "unowned" findings, since legitimate reasons for that exist too
     # (custom-compiled drivers) — worth a look, not proof by itself.
-    for f in "${root}/boot"/vmlinuz* "${root}/boot"/initrd* "${root}/boot"/initramfs* \
+    # /boot/initrd*/initramfs* are skipped: built locally by update-initramfs,
+    # never package-owned, so they were reported UNOWNED on every run. So
+    # are symlinks to a /boot/vmlinuz-X (Ubuntu /boot/vmlinuz): X is checked.
+    local alt
+    for f in "${root}/boot"/vmlinuz* \
              $(find "${root}/lib/modules" -name "*.ko" -o -name "*.ko.xz" -o -name "*.ko.zst" 2>/dev/null); do
         [ -f "$f" ] || continue
+        if [ -L "$f" ]; then
+            case "$(readlink -f "$f")" in "$(readlink -f "${root}/boot")"/vmlinuz-*) continue ;; esac
+        fi
         relpath="${f#$root/}"
         pkg=$(dpkg "${dpkg_root_arg[@]}" -S "/$relpath" 2>/dev/null | head -1 | cut -d: -f1)
+        # Merged /usr: Debian 13 packages record usr/lib/modules, find prints
+        # lib/modules. Retry the alias only if both names are the same file.
+        if [ -z "$pkg" ]; then
+            case "$relpath" in
+                usr/*) alt="${relpath#usr/}" ;;
+                *)     alt="usr/$relpath" ;;
+            esac
+            if [ "${root}/$alt" -ef "$f" ]; then
+                pkg=$(dpkg "${dpkg_root_arg[@]}" -S "/$alt" 2>/dev/null | head -1 | cut -d: -f1)
+                [ -n "$pkg" ] && relpath="$alt"
+            fi
+        fi
         if [ -z "$pkg" ]; then
             echo -e "${Y}[!] [KERNEL_FILE_UNOWNED] ${f} — not tracked by any installed package${Z}"
             found=$(( found + 1 ))
@@ -3483,7 +3502,7 @@ scan_kernel_integrity() {
         md5file="${root}/var/lib/dpkg/info/${pkg}.md5sums"
         [ -f "$md5file" ] || md5file="${root}/var/lib/dpkg/info/${pkg%:*}.md5sums"
         [ -f "$md5file" ] || continue
-        expected=$(grep -F "  ${relpath}" "$md5file" 2>/dev/null | awk '{print $1}' | head -1)
+        expected=$(awk -v p="$relpath" 'substr($0, 35) == p { print $1; exit }' "$md5file" 2>/dev/null)
         [ -z "$expected" ] && continue
         actual=$(md5sum "$f" 2>/dev/null | cut -d' ' -f1)
         if [ "$expected" != "$actual" ]; then
@@ -5043,14 +5062,30 @@ _verify_package_file() {
         # unowned file (manually installed software, etc.) hits the same
         # slow "confirm the negative" path — cap the worst case instead of
         # letting a single lookup stall a whole batch.
+        local dpath="$file" alt=""
         pkg=$(timeout 2 dpkg -S "$file" 2>/dev/null | head -1 | cut -d: -f1)
+        # Merged /usr (/bin -> usr/bin): the scan finds /usr/bin/su, dpkg
+        # recorded /bin/su (or the reverse on Debian 13). Retry the alias,
+        # only if both names are the same file.
+        if [ -z "$pkg" ]; then
+            case "$file" in
+                /usr/bin/*|/usr/sbin/*|/usr/lib/*|/usr/lib64/*) alt="${file#/usr}" ;;
+                /bin/*|/sbin/*|/lib/*|/lib64/*) alt="/usr$file" ;;
+            esac
+            if [ -n "$alt" ] && [ "$alt" -ef "$file" ]; then
+                pkg=$(timeout 2 dpkg -S "$alt" 2>/dev/null | head -1 | cut -d: -f1)
+                [ -n "$pkg" ] && dpath="$alt"
+            fi
+        fi
         if [ -n "$pkg" ]; then
             local md5file="/var/lib/dpkg/info/${pkg}.md5sums"
             [ -f "$md5file" ] || md5file="/var/lib/dpkg/info/${pkg%:*}.md5sums"
             if [ -f "$md5file" ]; then
-                local relpath="${file#/}"
+                local relpath="${dpath#/}"
                 local expected
-                expected=$(bb grep -F "  ${relpath}" "$md5file" 2>/dev/null | awk '{print $1}' | head -1)
+                # Exact path (md5 + 2 spaces = column 35): a substring
+                # match could take e.g. usr/bin/fooX's sum for usr/bin/foo.
+                expected=$(awk -v p="$relpath" 'substr($0, 35) == p { print $1; exit }' "$md5file" 2>/dev/null)
                 if [ -n "$expected" ]; then
                     local actual
                     actual=$(bb md5sum "$file" 2>/dev/null | bb grep -oE '[0-9a-f]{32}' | head -1)
@@ -5064,12 +5099,21 @@ _verify_package_file() {
         fi
     elif command -v rpm &>/dev/null; then
         if timeout 2 rpm -qf "$file" &>/dev/null; then
-            local vout
-            vout=$(timeout 2 rpm -Vf "$file" 2>/dev/null)
-            if [ -z "$vout" ]; then
-                result="verified"
-            elif echo "$vout" | bb grep -q "^..5"; then
-                result="tampered"
+            local vout rc l mine=""
+            # rpm -Vf checks the WHOLE package: an edited /etc/pam.d/su made
+            # /usr/bin/su "tampered". Keep only the line for this same file
+            # (-ef: rpm prints /usr/bin/su for /bin/su); a timeout (124) or
+            # a failure without output stays unverified.
+            vout=$(timeout 2 rpm -Vf "$file" 2>/dev/null); rc=$?
+            if [ "$rc" -eq 0 ] || { [ "$rc" -ne 124 ] && [ -n "$vout" ]; }; then
+                while IFS= read -r l; do
+                    case "$l" in */*) [ "/${l#*/}" -ef "$file" ] && mine+="$l"$'\n' ;; esac
+                done <<< "$vout"
+                if [ -z "$mine" ]; then
+                    result="verified"
+                elif echo "$mine" | bb grep -q "^..5"; then
+                    result="tampered"
+                fi
             fi
         fi
     fi
@@ -5184,7 +5228,7 @@ _archive_type() {
 # Both fixed below: conditional binds are built into an ARGS ARRAY with
 # separate statements before bwrap ever runs (no inline "|| true" inside
 # its argument list), and chroot mode unmounts everything (in reverse
-# order) in a trap before removing the directory.
+# order) after the jail exits, before removing the directory.
 #
 # SANDBOX_MODE/SANDBOX_USER/SANDBOX_MEM_KB/SANDBOX_CPU_SEC are already set
 # from positional params above (33-38) — no re-declaration needed here.
@@ -5334,9 +5378,15 @@ _sandbox_run_chroot() {
         done
         [ "$still_mounted" = false ] && rm -rf "$chroot_dir" 2>/dev/null
     }
-    trap _cleanup_chroot RETURN
-
+    # Called directly, not via "trap ... RETURN": that trap is global and
+    # outlived this call (after _sandbox_resolve's probe it fired on every
+    # later function return -> "mounted: unbound variable"); "trap -"
+    # inside the handler does not clear it.
+    local rc
     chroot "$chroot_dir" /bin/bash -c 'cd "$1"; shift; exec "$@"' _ "$target_dir" "$@"
+    rc=$?
+    _cleanup_chroot
+    return $rc
 }
 
 _sandbox_run_simple() {
@@ -5383,10 +5433,12 @@ _sandbox_run_simple() {
         ulimit -n 256 2>/dev/null
         ulimit -u 128 2>/dev/null
         cd "$target_dir" 2>/dev/null || true
+        # exec: the bomb guard in scan_archive signals this process; as a
+        # plain subshell it died and left timeout + tar running.
         if [ ${#dropper[@]} -gt 0 ]; then
-            "${dropper[@]}" "$@"
+            exec "${dropper[@]}" "$@"
         else
-            "$@"
+            exec "$@"
         fi
     )
 }
@@ -5542,39 +5594,37 @@ _archive_batch_hash_check() {
     done
     [ ${#valid[@]} -eq 0 ] && return
 
-    local rel out hits h n
-
-    if [ "$HAS_SHA256" = true ] && [ "$SHA256_CMD" != "none" ]; then
-        out=$($SHA256_CMD "${valid[@]}" 2>/dev/null)
-        hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | _real_grep -F -f - "$SIG_DIR/sha256.tsv" 2>/dev/null | cut -f1)
-        if [ -n "$hits" ]; then
-            while IFS= read -r h; do
-                [ -z "$h" ] && continue
-                n=$(_real_grep -m 1 "^${h}" "$SIG_DIR/sha256.tsv" 2>/dev/null | cut -f2)
-                m=$(printf '%s\n' "$out" | bb grep -iE "^${h}\s+" | sed 's/^[^ ]*[ ]*//' | head -1)
-                [ -z "$m" ] && continue
-                rel="${m#$extract_dir/}"
-                [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
-                threat "KNOWN_MALWARE" "$top_archive" "archive_member=${rel}|name=${n:-Malware}|sha256=$h"
-            done <<< "$hits"
+    # Same parsing as process_hash_batch (H2/H10): only hex hashes go to
+    # grep (an empty pattern matched every line of the .tsv and the loop
+    # below then ran per line -- a hang when hashing printed nothing),
+    # coreutils' "\" prefix for names with "\" or newline is stripped,
+    # and every member with a matching hash is reported.
+    local htype cmd sig_file out hits hit_hash tname ln h f rel
+    for htype in sha256 md5; do
+        if [ "$htype" = sha256 ]; then
+            [ "$HAS_SHA256" = true ] || continue; cmd="$SHA256_CMD"
+        else
+            [ "$HAS_MD5" = true ] || continue; cmd="$MD5_CMD"
         fi
-    fi
-
-    if [ "$HAS_MD5" = true ] && [ "$MD5_CMD" != "none" ]; then
-        out=$($MD5_CMD "${valid[@]}" 2>/dev/null)
-        hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | _real_grep -F -f - "$SIG_DIR/md5.tsv" 2>/dev/null | cut -f1)
-        if [ -n "$hits" ]; then
-            while IFS= read -r h; do
-                [ -z "$h" ] && continue
-                n=$(_real_grep -m 1 "^${h}" "$SIG_DIR/md5.tsv" 2>/dev/null | cut -f2)
-                m=$(printf '%s\n' "$out" | bb grep -iE "^${h}\s+" | sed 's/^[^ ]*[ ]*//' | head -1)
-                [ -z "$m" ] && continue
-                rel="${m#$extract_dir/}"
+        [ "$cmd" = "none" ] && continue
+        sig_file="$SIG_DIR/$htype.tsv"
+        out=$($cmd "${valid[@]}" 2>/dev/null)
+        [ -z "$out" ] && continue
+        hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | sed 's/^\\//' | bb grep -E '^[0-9a-fA-F]+$' | _real_grep -F -f - "$sig_file" 2>/dev/null | cut -f1 | sort -u)
+        [ -z "$hits" ] && continue
+        while IFS= read -r hit_hash; do
+            [ -z "$hit_hash" ] && continue
+            tname=$(_real_grep -m 1 "^${hit_hash}" "$sig_file" 2>/dev/null | cut -f2)
+            while IFS= read -r ln; do
+                h="${ln%% *}"; f="${ln:${#h}+2}"
+                if [ "${h:0:1}" = '\' ]; then h="${h:1}"; f=$(printf '%b' "$f"); fi
+                [ "${h,,}" = "${hit_hash,,}" ] && [ -n "$f" ] || continue
+                rel="${f#$extract_dir/}"
                 [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
-                threat "KNOWN_MALWARE" "$top_archive" "archive_member=${rel}|name=${n:-Malware}|md5=$h"
-            done <<< "$hits"
-        fi
-    fi
+                threat "KNOWN_MALWARE" "$top_archive" "archive_member=${rel//$'\n'/?}|name=${tname:-Malware}|$htype=$hit_hash"
+            done <<< "$out"
+        done <<< "$hits"
+    done
 }
 
 # Batched YARA check across ALL members of one archive in ONE call. This is
@@ -5601,6 +5651,27 @@ _archive_batch_yara_check() {
     # parallelism should live, not duplicated inside every yara call too.
     local yflags=(-d filename= -d filepath= -d extension= -p 1 -a "$YARA_TIMEOUT_SEC")
     case "$YARA_TARGET" in *.yarc) yflags+=(-C) ;; esac
+
+    # A newline in a member name splits the --scan-list entry and the
+    # "rule path" output line, so the member went unscanned. Scan a hard
+    # link (copy if that fails) with a plain name instead; map it back.
+    local -A nl_orig=()
+    local -a scan=()
+    local nl_dir="" k=0 s
+    for s in "$@"; do
+        case "$s" in
+            *$'\n'*)
+                [ -n "$nl_dir" ] || nl_dir=$(mktemp -d "$extract_dir/.nl.XXXXXX" 2>/dev/null) || continue
+                k=$(( k + 1 ))
+                ln -- "$s" "$nl_dir/$k" 2>/dev/null || cp -- "$s" "$nl_dir/$k" 2>/dev/null || continue
+                nl_orig["$nl_dir/$k"]="$s"
+                scan+=("$nl_dir/$k")
+                ;;
+            *) scan+=("$s") ;;
+        esac
+    done
+    [ ${#scan[@]} -eq 0 ] && return
+    set -- "${scan[@]}"
 
     local yara_out
     if [ "$YARA_HAS_SCAN_LIST" = true ]; then
@@ -5630,6 +5701,7 @@ _archive_batch_yara_check() {
         fi
         rm -rf "$tmpdir2"
     fi
+    [ -n "$nl_dir" ] && rm -rf "$nl_dir"
 
     [ -z "$yara_out" ] && return
     local yline yrule yfile rel spat
@@ -5637,8 +5709,10 @@ _archive_batch_yara_check() {
         [ -z "$yline" ] && continue
         yrule=$(echo "$yline" | awk '{print $1}')
         yfile=$(echo "$yline" | cut -d' ' -f2-)
+        yfile="${nl_orig[$yfile]:-$yfile}"
         rel="${yfile#$extract_dir/}"
         [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
+        rel="${rel//$'\n'/?}"
         if spat=$(_resolve_str_sig "$yrule"); then
             threat "SIG_STRING_MATCH" "$top_archive" "archive_member=${rel}|pattern=${spat:0:50}"
         elif _is_vendor_obfuscation "$yrule" "$yfile"; then
@@ -5657,29 +5731,39 @@ scan_archive() {
     local top_archive="$1" cur="${2:-$1}" cur_rel="${3:-}"
     [ "$SCAN_ARCHIVES" = "true" ] || return
 
-    local asize
-    asize=$(_stat_size "$cur" 2>/dev/null) || return
-    [ "${asize:-0}" -gt $(( ARCHIVE_MAX_MB * 1024 * 1024 )) ] && return
-
+    # Type first (called for every file): only real archives get a skip log.
+    local where="$top_archive${cur_rel:+ (member $cur_rel)}"
     local atype
     atype=$(_archive_type "$cur")
-    [ -z "$atype" ] && return
+    if [ -z "$atype" ]; then
+        case "${cur,,}" in
+            *.7z|*.rar) log "Archive NOT scanned (7z/unrar not installed): $where" ;;
+        esac
+        return
+    fi
+
+    local asize
+    asize=$(_stat_size "$cur" 2>/dev/null) || return
+    if [ "${asize:-0}" -gt $(( ARCHIVE_MAX_MB * 1024 * 1024 )) ]; then
+        log "Archive NOT scanned (larger than --archive-max-mb ${ARCHIVE_MAX_MB}MB): $where"
+        return
+    fi
 
     local extract_dir
     extract_dir=$(_archive_tmpdir $(( asize / 1024 / 1024 ))) || return
     # Tracked so a graceful interrupt (TERM/INT — see trap near the top of
     # this worker script) can still clean this up even if the worker gets
     # killed mid-extraction, before reaching this function's own rm -rf at
-    # the end. Not removed from the array on the normal path below — a
-    # second rm -rf on an already-gone directory is a harmless no-op, and
-    # keeping this simple matters more than pruning it precisely.
+    # the end. Trimmed back to n_tracked after the rm -rf below (nested
+    # calls finish first), so a long -w -A daemon doesn't grow it forever.
+    local n_tracked=${#_ACTIVE_EXTRACT_DIRS[@]}
     _ACTIVE_EXTRACT_DIRS+=("$extract_dir")
 
     # H5: extract from a root-made private copy, not the site's file — a
     # privilege-dropped sandbox can't read a 0600 archive owned by the site
     # user, and bwrap/chroot then bind only this copy's dir, not the site's.
     local stage_dir staged
-    stage_dir=$(mktemp -d "${extract_dir}_in.XXXXXX" 2>/dev/null) || { rm -rf "$extract_dir"; return; }
+    stage_dir=$(mktemp -d "${extract_dir}_in.XXXXXX" 2>/dev/null) || { rm -rf "$extract_dir"; _ACTIVE_EXTRACT_DIRS=("${_ACTIVE_EXTRACT_DIRS[@]:0:n_tracked}"); return; }
     _ACTIVE_EXTRACT_DIRS+=("$stage_dir")
     staged="$stage_dir/${cur##*/}"
     # -P + checks on the copy: the file may have been swapped for a symlink
@@ -5687,7 +5771,7 @@ scan_archive() {
     timeout 30 cp -P -- "$cur" "$staged" 2>/dev/null
     if [ -L "$staged" ] || [ ! -f "$staged" ] || \
        [ "$(_stat_size "$staged" 2>/dev/null || echo 0)" -gt $(( ARCHIVE_MAX_MB * 1024 * 1024 )) ]; then
-        rm -rf "$extract_dir" "$stage_dir"; return
+        rm -rf "$extract_dir" "$stage_dir"; _ACTIVE_EXTRACT_DIRS=("${_ACTIVE_EXTRACT_DIRS[@]:0:n_tracked}"); return
     fi
     chmod 0400 "$staged" 2>/dev/null
     _sandbox_resolve
@@ -5709,9 +5793,20 @@ scan_archive() {
         extracted_kb=$(du -sk "$extract_dir" 2>/dev/null | awk '{print $1}')
         if [ -n "$extracted_kb" ] && [ "$extracted_kb" -gt $(( ARCHIVE_MAX_EXTRACT_MB * 1024 )) ]; then
             bomb_killed=true
-            pkill -TERM -P "$extract_pid" 2>/dev/null
-            kill -TERM "$extract_pid" 2>/dev/null
-            sleep 0.5
+            # TERM every descendant, not the extract subshell: killing it
+            # first orphaned timeout+tar (simple mode), which kept writing
+            # past the cap, and `unshare --fork` ignores TERM. The subshell
+            # then returns normally, so chroot mode still unmounts.
+            local lvl="$extract_pid" desc="" p w
+            while [ -n "$lvl" ]; do
+                lvl=$(for p in $lvl; do pgrep -P "$p"; done 2>/dev/null)
+                desc="$desc $lvl"
+            done
+            [ -n "${desc// /}" ] && kill -TERM $desc 2>/dev/null
+            for w in 1 2 3 4 5 6; do
+                kill -0 "$extract_pid" 2>/dev/null || break
+                sleep 0.5
+            done
             pkill -KILL -P "$extract_pid" 2>/dev/null
             kill -KILL "$extract_pid" 2>/dev/null
             break
@@ -5742,7 +5837,10 @@ scan_archive() {
     local inner n=0
     while IFS= read -r -d '' inner; do
         n=$(( n + 1 ))
-        [ "$n" -gt "$ARCHIVE_MAX_FILES" ] && break
+        if [ "$n" -gt "$ARCHIVE_MAX_FILES" ]; then
+            log "Archive partly scanned (only first ${ARCHIVE_MAX_FILES} members, --archive-max-files): $where"
+            break
+        fi
         members+=("$inner")
     done < <(find "$extract_dir" -type f -print0 2>/dev/null)
 
@@ -5778,6 +5876,7 @@ scan_archive() {
     fi
 
     rm -rf "$extract_dir"
+    _ACTIVE_EXTRACT_DIRS=("${_ACTIVE_EXTRACT_DIRS[@]:0:n_tracked}")
 }
 
 do_strings() {
