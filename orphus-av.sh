@@ -116,6 +116,11 @@
 #   --quarantine-dir PATH   Enable quarantine mode with a custom directory
 #   --quarantine-perm MODE  chmod mode for quarantined files (default: 0400,
 #                            i.e. read-only, not executable)
+#   --restore PATH          Put a quarantined file back (PATH = original
+#                            path or the file inside the quarantine dir;
+#                            use with --quarantine-dir if not default).
+#                            Restores owner/mode, checks sha256, never
+#                            overwrites, refuses symlinked target dirs.
 #   --quarantine-max N      Stop moving files after N per worker (default
 #                            100). Only signature hits (hash/YARA/ClamAV/
 #                            string/hex) are moved; heuristic findings,
@@ -515,6 +520,7 @@ QUARANTINE_SKIP_ARCHIVES=false  # --no-quarantine-archives: when a threat
                         # normal but leaves the container in place,
                         # letting a person review and decide by hand.
 QUARANTINE_DIR="${SCRIPT_DIR}/quarantine"
+RESTORE_ARG=""             # --restore PATH: put a quarantined file back
 QUARANTINE_MAX=100       # --quarantine-max N: stop moving files after N per worker
 QUARANTINE_PERM="0400"   # read-only, not executable (NOT literal "100" —
                           # that means --x------, the opposite)
@@ -1526,6 +1532,7 @@ parse_args() {
             --quarantine-dry-run) QUARANTINE_ENABLED=true; QUARANTINE_DRY_RUN=true; shift ;;
             --no-quarantine-archives) QUARANTINE_SKIP_ARCHIVES=true; shift ;;
             --quarantine-dir)  QUARANTINE_ENABLED=true; QUARANTINE_DIR="$2"; shift 2 ;;
+            --restore)         RESTORE_ARG="$2"; shift 2 ;;
             --quarantine-perm) QUARANTINE_PERM="$2"; shift 2 ;;
             --quarantine-max)  QUARANTINE_MAX="$2"; shift 2 ;;
             -w|--real-time|--realtime) REALTIME_MODE=true; shift ;;
@@ -3136,6 +3143,36 @@ _sweep_stale_shm_dirs() {
 # Self-test: a broken ruleset (failed compile, wrong flags) otherwise
 # looks exactly like "0 threats, CLEAN". The built-in string signature
 # "eval(base64_decode" is always compiled into the YARA set.
+# --restore: manifest columns are original <TAB> quarantined <TAB> type
+# <TAB> time <TAB> uid:gid:mode <TAB> sha256 (older entries lack the last two).
+restore_from_quarantine() {
+    local want="$1" m="$QUARANTINE_DIR/manifest.tsv" orig q type ts meta sum dir n=0
+    [ -s "$m" ] || { echo -e "${R}[FAIL] No quarantine manifest: $m${Z}"; return 2; }
+    while IFS=$'\t' read -r orig q type ts meta sum; do
+        [ "$want" = "$orig" ] || [ "$want" = "$q" ] || continue
+        [ -f "$q" ] || continue                       # already restored
+        if [ -e "$orig" ] || [ -L "$orig" ]; then
+            echo -e "${Y}[SKIP] Target exists, not overwriting: $orig${Z}"; continue
+        fi
+        dir=$(dirname -- "$orig")
+        if [ "$(cd -P -- "$dir" 2>/dev/null && pwd -P)" != "$dir" ]; then
+            echo -e "${R}[FAIL] Target dir missing or reached through a symlink: $dir${Z}"; continue
+        fi
+        if [ -n "$sum" ] && [ "$(sha256sum "$q" 2>/dev/null | cut -d' ' -f1)" != "$sum" ]; then
+            echo -e "${R}[FAIL] sha256 changed inside quarantine, not restoring: $q${Z}"; continue
+        fi
+        mv -n -- "$q" "$orig" || continue
+        if [ -n "$meta" ]; then
+            chown -- "${meta%:*}" "$orig" 2>/dev/null
+            chmod -- "${meta##*:}" "$orig" 2>/dev/null
+        fi
+        echo -e "${G}[OK] Restored ($type): $orig${Z}"
+        n=$((n + 1))
+    done < "$m"
+    [ "$n" -gt 0 ] || { echo -e "${R}[FAIL] Nothing restored for: $want${Z}"; return 1; }
+    return 0
+}
+
 yara_self_test() {
     [ "$YARA_CMD" != "none" ] || return 0
     local target="" flags=(-d filename= -d filepath= -d extension=) probe
@@ -4233,6 +4270,11 @@ main() {
     if [ "$DO_CHECK_DEPS" = true ]; then
         check_dependencies_report
         exit 0
+    fi
+
+    if [ -n "$RESTORE_ARG" ]; then
+        restore_from_quarantine "$RESTORE_ARG"
+        exit $?
     fi
 
     # BusyBox bootstrap must happen before everything else — the signature
