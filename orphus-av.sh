@@ -2613,8 +2613,11 @@ EOF
         # ~73% of "any file" rules are Win.* and only cost scan time here.
         function clam_platform_ok(name,    p) {
             if (CLAM_WIN) return 1
-            p = name; sub(/[.].*/, "", p)
-            return (p ~ /^(Unix|Html|Js|Php|Txt|Py|Perl|Asp|Xml|Java|Multios|Email|PUA)$/)
+            # Maldet rfxn.ndb names are "{HEX}php.cmdshell.c99.6": strip the
+            # tag, then keep its lowercase Linux/web families.
+            p = name; sub(/^[{][A-Za-z]+[}]/, "", p); sub(/[.].*/, "", p)
+            return (p ~ /^(Unix|Html|Js|Php|Txt|Py|Perl|Asp|Xml|Java|Multios|Email|PUA)$/ ||
+                    p ~ /^(php|perl|shell|js|web|html|iframe|magento|java|asp|jsp|linux|bin|c|multi)$/)
         }
         BEGIN {
             for (i = 0; i < 10; i++) HEXV[i ""] = i
@@ -3097,12 +3100,29 @@ EOF
     # for *.yar/*.yara files (any subdirectory, not just yara/), and those
     # files are excluded from sig_files/generic_files below so they're
     # compiled as actual YARA rules, not misrouted as hash/pattern text.
+    #
+    # Order matters under the 500-file cap (plain "sort | head" used to take
+    # only Yara-Rules and no signature-base file at all): 1) maldet/webshell/
+    # PHP/CMS files, 2) Linux ones, 3) the rest. Never taken: index files
+    # (they re-include other files), deprecated/, Yara-Rules utils/ crypto/
+    # capabilities/ email/ (indicator rules - domain, url, base64, crypto
+    # constants, "with_urls" - that match thousands of clean files), and
+    # without --clam-windows the Windows/Android-only Yara-Rules dirs
+    # (except tier 1/2 files).
     if [ -d "$sig_input" ]; then
-        local yar_total
-        yar_total=$(bb find "$sig_input" -not -path '*/.git/*' -not -path '*/.cache/*' \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null | bb wc -l | tr -d ' ')
+        local yar_list yar_total
+        yar_list=$(bb find "$sig_input" -not -path '*/.git/*' -not -path '*/.cache/*' \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null | \
+            bb awk -v pre="$sig_input" -v win="$CLAM_WINDOWS" '
+                { p = tolower(substr($0, length(pre) + 1)); b = p; sub(/.*\//, "", b) }
+                p ~ /\/(deprecated|utils|crypto|capabilities|email)\// || b ~ /index/ { next }
+                p ~ /(rfxn|webshell|wshell|php|magento|wordpress|joomla|drupal)/ { print 1 "\t" $0; next }
+                p ~ /(linux|lnx|unix|elf|mirai|gafgyt|miner)/ { print 2 "\t" $0; next }
+                win != "true" && p ~ /\/rules\/(malware|maldocs|mobile_malware|antidebug_antivm|packers)\// { next }
+                { print 3 "\t" $0 }' | sort | cut -f2-)
+        yar_total=$(printf '%s\n' "$yar_list" | grep -c .)
         [ "${yar_total:-0}" -gt 500 ] && echo -e "${Y}[WARN] ${yar_total} YARA rule files found, only the first 500 are used${Z}"
-        bb find "$sig_input" -not -path '*/.git/*' -not -path '*/.cache/*' \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null | sort | head -500 | while read -r yf; do
-            cp "$yf" "$out_dir/yara/" 2>/dev/null || true
+        printf '%s\n' "$yar_list" | head -500 | while read -r yf; do
+            [ -n "$yf" ] && cp "$yf" "$out_dir/yara/" 2>/dev/null || true
         done
     fi
 
