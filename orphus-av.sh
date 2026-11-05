@@ -3936,9 +3936,15 @@ collect_files() {
         [ -n "$p" ] || continue
         # ROOT_DIR is a physical path (normalize_args), so find prints
         # physical paths: also exclude each path's symlink-resolved form
-        # (e.g. scanner installed under www -> public_html).
+        # (e.g. scanner installed under www -> public_html). Resolve the
+        # parent only: the last component may be site-owned, and a -X dir
+        # swapped for a symlink to the docroot would prune the whole site.
+        # Never prune ROOT_DIR or anything above it.
         prune+=("$p")
-        q=$(_phys_path "$p"); [ "$q" != "$p" ] && prune+=("$q")
+        q=$(_phys_path "$(dirname -- "$p")"); [ "$q" = / ] && q=""
+        q="$q/${p##*/}"
+        case "$ROOT_DIR/" in "${q%/}/"*) continue ;; esac
+        [ "$q" != "$p" ] && prune+=("$q")
     done
     for p in "${prune[@]}"; do
         [ "${#excl[@]}" -gt 1 ] && excl+=(-o)
