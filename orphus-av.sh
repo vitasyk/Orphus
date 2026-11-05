@@ -2000,10 +2000,19 @@ EOF
 # interrupted scan still leaves usable results behind instead of losing
 # everything found up to that point.
 init_live_report() {
-    local f dir
+    local f dir mode
     if [ -n "$OUTPUT_FILE" ]; then
         # Root writing through a planted symlink (e.g. -> /etc/shadow)
-        # would truncate/append to the target.
+        # would truncate/append to the target. The report is rewritten
+        # during and at the end of the scan, so a check on the file alone
+        # races: whoever can write the -o directory could swap in a
+        # symlink later. Require a directory only we can write.
+        dir="${OUTPUT_FILE%/*}"; [ -n "$dir" ] || dir=/
+        mode=$(stat -c %a "$dir" 2>/dev/null || stat -f %Lp "$dir" 2>/dev/null)
+        if [ -L "$dir" ] || [ ! -O "$dir" ] || [ -z "$mode" ] || (( 8#$mode & 8#022 )); then
+            echo -e "${R}[FAIL] -o: directory must be owned by you and not group/world-writable: $dir${Z}" >&2
+            exit 2
+        fi
         for f in "$OUTPUT_FILE" "${OUTPUT_FILE}-SUID" "${OUTPUT_FILE}.slow"; do
             if [ -L "$f" ]; then
                 echo -e "${R}[FAIL] -o: refusing to write through a symlink: $f${Z}" >&2
