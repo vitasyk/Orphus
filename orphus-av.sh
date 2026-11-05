@@ -4416,7 +4416,7 @@ build_report() {
  INCOMPLETE         : $UNFINISHED worker(s) died -- only $TF of ${TOTAL_FILES:-0} queued files scanned"
     elif [ "${YARA_SKIPPED:-0}" -gt 0 ]; then
         incomplete_line="
- INCOMPLETE         : ${YARA_SKIPPED} file(s) not checked by YARA (memory limit) -- see report"
+ INCOMPLETE         : ${YARA_SKIPPED} YARA check(s) failed (memory limit or yara error) -- see report"
     elif [ "$TF" -lt "${TOTAL_FILES:-0}" ] 2>/dev/null; then
         incomplete_line="
  Not scanned        : $(( TOTAL_FILES - TF )) of $TOTAL_FILES queued (gone or unreadable when reached)"
@@ -4494,7 +4494,7 @@ print_report() {
         echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${UNFINISHED} worker(s) died before finishing -- NOT a clean result (exit 2)${Z}"
     elif [ "${YARA_SKIPPED:-0}" -gt 0 ]; then
         echo -e "${Y}${RPT}${Z}"
-        echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${YARA_SKIPPED} file(s) not checked by YARA (memory limit) -- NOT a clean result (exit 2)${Z}"
+        echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${YARA_SKIPPED} YARA check(s) failed (memory limit or yara error) -- NOT a clean result (exit 2)${Z}"
     elif [ "${NO_COVERAGE:-0}" -gt 0 ]; then
         echo -e "${Y}${RPT}${Z}"
         echo -e "\n ${Y}[WARN] INCOMPLETE: no hash signatures and no YARA -- run with -u (and --setup for YARA)${Z}"
@@ -4538,7 +4538,7 @@ save_report() {
         [ -n "$gaps" ] && { echo -e "\n=== NOT FULLY SCANNED ==="; echo "$gaps"; }
     } > "$LIVE_REPORT_FILE"
     echo -e "\n[*] Report saved: ${C}${LIVE_REPORT_FILE}${Z}"
-    [ -n "$gaps" ] && echo -e "${Y}[!] $(printf '%s\n' "$gaps" | wc -l | tr -d ' ') item(s) not fully scanned (archives / YARA memory limit) -- see the report${Z}"
+    [ -n "$gaps" ] && echo -e "${Y}[!] $(printf '%s\n' "$gaps" | wc -l | tr -d ' ') item(s) not fully scanned (archives / YARA limit or error) -- see the report${Z}"
 
     # SUID/SGID findings, same source data, separate file — see the
     # comment in init_live_report() for why. Only written if there's
@@ -6656,6 +6656,12 @@ _yara_run() {
                 *) log "YARA scan error: ${l#error scanning }" ;;
             esac
         done < <(bb grep '^error scanning ' "$err" 2>/dev/null)
+        # The whole call failed (killed, crashed, rules didn't load) with no
+        # per-file error to explain it: every file in it went unchecked.
+        # 124 = timeout, handled by the callers (bisect / SCAN_TIMEOUT).
+        if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ! bb grep -q '^error scanning ' "$err" 2>/dev/null; then
+            log "YARA skipped (memory limit or yara failure, rc=$rc): whole call, target ${*: -1}"
+        fi
         rm -f "$err"
     fi
     return "$rc"
