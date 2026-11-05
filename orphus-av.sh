@@ -3654,12 +3654,16 @@ scan_kernel_integrity() {
     # /boot/initrd*/initramfs* are skipped: built locally by update-initramfs,
     # never package-owned, so they were reported UNOWNED on every run. So
     # are symlinks to a /boot/vmlinuz-X (Ubuntu /boot/vmlinuz): X is checked.
-    local alt
+    local alt t
     for f in "${root}/boot"/vmlinuz* \
              $(find "${root}/lib/modules" -name "*.ko" -o -name "*.ko.xz" -o -name "*.ko.zst" 2>/dev/null); do
         [ -f "$f" ] || continue
         if [ -L "$f" ]; then
-            case "$(readlink -f "$f")" in "$(readlink -f "${root}/boot")"/vmlinuz-*) continue ;; esac
+            # Skip only a link to a regular vmlinuz-* directly in /boot
+            # (checked by this same loop); anything else is checked below.
+            t=$(readlink -f "$f")
+            [ "${t%/*}" = "$(readlink -f "${root}/boot")" ] && [ -f "$t" ] && \
+                case "${t##*/}" in vmlinuz-*) continue ;; esac
         fi
         relpath="${f#$root/}"
         pkg=$(dpkg "${dpkg_root_arg[@]}" -S "/$relpath" 2>/dev/null | head -1 | cut -d: -f1)
@@ -6282,7 +6286,9 @@ do_file_type() {
 # ----------------------------------------------------------------------------
 # MODULE: logging
 # ----------------------------------------------------------------------------
-log() { printf '[%s] %s\n' "$WORKER_ID" "$*" >> "$REPORT"; }
+# CR/LF masked: messages can carry attacker-chosen names (archive members),
+# and a raw newline could forge a "THREAT:" line in the report.
+log() { local m="$*"; m="${m//$'\n'/?}"; printf '[%s] %s\n' "$WORKER_ID" "${m//$'\r'/?}" >> "$REPORT"; }
 
 # threat() — single entry point for any finding: checks ignore_sigs first
 # (a match suppresses the detection entirely — no log, no quarantine), then
