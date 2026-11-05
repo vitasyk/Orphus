@@ -632,6 +632,7 @@ TT=0            # threats found (total across workers)
 QC=0            # quarantined (total across workers)
 SC=0            # suppressed by ignore_sigs (total across workers)
 UNFINISHED=0    # workers that exited without writing their .done marker
+YARA_SKIPPED=0  # files YARA skipped at the memory cap (run is INCOMPLETE)
 SPEED=0
 RPT=""          # final report text
 
@@ -4323,10 +4324,14 @@ build_report() {
     for r in "$WORK_DIR/reports"/pool_*.txt; do
         [ -f "$r" ] && [ ! -f "${r%.txt}.done" ] && UNFINISHED=$(( UNFINISHED + 1 ))
     done
+    YARA_SKIPPED=$(cat "$WORK_DIR/reports"/pool_*.txt 2>/dev/null | bb grep -c '^\[[^]]*\] YARA skipped (memory limit')
     local incomplete_line=""
     if [ "$UNFINISHED" -gt 0 ]; then
         incomplete_line="
  INCOMPLETE         : $UNFINISHED worker(s) died — only $TF of ${TOTAL_FILES:-0} queued files scanned"
+    elif [ "${YARA_SKIPPED:-0}" -gt 0 ]; then
+        incomplete_line="
+ INCOMPLETE         : ${YARA_SKIPPED} file(s) not checked by YARA (memory limit) — see report"
     elif [ "$TF" -lt "${TOTAL_FILES:-0}" ] 2>/dev/null; then
         incomplete_line="
  Not scanned        : $(( TOTAL_FILES - TF )) of $TOTAL_FILES queued (gone or unreadable when reached)"
@@ -4395,6 +4400,9 @@ print_report() {
     elif [ "${UNFINISHED:-0}" -gt 0 ]; then
         echo -e "${Y}${RPT}${Z}"
         echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${UNFINISHED} worker(s) died before finishing — NOT a clean result (exit 2)${Z}"
+    elif [ "${YARA_SKIPPED:-0}" -gt 0 ]; then
+        echo -e "${Y}${RPT}${Z}"
+        echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${YARA_SKIPPED} file(s) not checked by YARA (memory limit) — NOT a clean result (exit 2)${Z}"
     else
         echo -e "${G}${RPT}${Z}"
         echo -e "\n ${G}[OK] No threats detected [CLEAN]${Z}"
@@ -4406,6 +4414,8 @@ print_report() {
 
 save_report() {
     [ -n "$LIVE_REPORT_FILE" ] || return 0
+    local gaps
+    gaps=$(bb grep -hE '^\[[^]]*\] (Archive (NOT|partly) scanned|YARA skipped)' "$WORK_DIR/reports"/pool_*.txt 2>/dev/null | cut -d' ' -f2- | bb sort -u)
     {
         echo "$RPT"
         [ "$TT" -gt 0 ] && {
@@ -4421,8 +4431,12 @@ save_report() {
                 | bb grep -v "^THREAT:SUID_SGID|" \
                 | cut -d: -f2- | bb sort -u
         }
+        # Coverage gaps the workers logged (worker log lines live only in
+        # WORK_DIR otherwise). Not threats: no count, no exit code change.
+        [ -n "$gaps" ] && { echo -e "\n=== NOT FULLY SCANNED ==="; echo "$gaps"; }
     } > "$LIVE_REPORT_FILE"
     echo -e "\n[*] Report saved: ${C}${LIVE_REPORT_FILE}${Z}"
+    [ -n "$gaps" ] && echo -e "${Y}[!] $(printf '%s\n' "$gaps" | wc -l | tr -d ' ') item(s) not fully scanned (archives / YARA memory limit) -- see the report${Z}"
 
     # SUID/SGID findings, same source data, separate file — see the
     # comment in init_live_report() for why. Only written if there's
@@ -4844,6 +4858,7 @@ main() {
     [ "$REALTIME_MODE" = true ] && exit 2
     [ "${TT:-0}" -gt 0 ] && exit 1
     [ "${UNFINISHED:-0}" -gt 0 ] && exit 2
+    [ "${YARA_SKIPPED:-0}" -gt 0 ] && exit 2
     exit 0
 }
 
@@ -6069,7 +6084,7 @@ _archive_batch_yara_check() {
         local listfile
         listfile=$(mktemp 2>/dev/null) || return
         printf '%s\n' "$@" > "$listfile"
-        yara_out=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yflags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
+        yara_out=$(_yara_run $(( YARA_TIMEOUT_SEC + 3 )) "${yflags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
         rm -f "$listfile"
     else
         local tmpdir2
@@ -6079,7 +6094,7 @@ _archive_batch_yara_check() {
             ln -sf "$f" "$tmpdir2/$(basename "$f")_$RANDOM" 2>/dev/null
         done
         local raw
-        raw=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yflags[@]}" -r "$YARA_TARGET" "$tmpdir2" 2>/dev/null)
+        raw=$(_yara_run $(( YARA_TIMEOUT_SEC + 3 )) "${yflags[@]}" -r "$YARA_TARGET" "$tmpdir2" 2>/dev/null)
         if [ -n "$raw" ]; then
             yara_out=$(while IFS= read -r l; do
                 [ -z "$l" ] && continue
@@ -6510,6 +6525,34 @@ process_hash_batch() {
 # ----------------------------------------------------------------------------
 # MODULE: yara matching
 # ----------------------------------------------------------------------------
+# _yara_run SECS ARGS... — yara under a hard timeout and a memory cap.
+# A file padded with short tags ("<?" x 1M) made one yara call use 3.8 GB
+# (webshell rules store every match). Under ulimit -v yara reports
+# "error scanning FILE: ... not enough memory" for that file only and
+# finishes the rest of the batch; such files are logged, not reported.
+# Cap: ORPHUS_YARA_MEM_MB (default 1536).
+_yara_run() {
+    local secs="$1" err l f rc; shift
+    err=$(mktemp 2>/dev/null) || err=/dev/null
+    ( ulimit -v $(( ${ORPHUS_YARA_MEM_MB:-1536} * 1024 )) 2>/dev/null
+      exec timeout "$secs" $YARA_CMD "$@" ) 2>"$err"
+    rc=$?
+    if [ "$err" != /dev/null ]; then
+        # Memory-limit skips make the run INCOMPLETE (build_report counts
+        # them): a webshell padded up to the cap must not pass as CLEAN.
+        # Other per-file errors (file vanished mid-scan) are log-only.
+        while IFS= read -r l; do
+            f="${l#error scanning }"; f="${f%%: *}"
+            case "$l" in
+                *memory*) log "YARA skipped (memory limit ${ORPHUS_YARA_MEM_MB:-1536} MB): $f" ;;
+                *) log "YARA scan error: ${l#error scanning }" ;;
+            esac
+        done < <(bb grep '^error scanning ' "$err" 2>/dev/null)
+        rm -f "$err"
+    fi
+    return "$rc"
+}
+
 # Called when a --scan-list batch hit (or nearly hit) the -a timeout —
 # retries the SAME batch one file at a time with a short per-file timeout,
 # so a single pathological file doesn't cost the whole batch's results and
@@ -6525,7 +6568,7 @@ _yara_bisect_slow_batch() {
     local f t0 t1 out
     for f in "$@"; do
         t0=$(_now_ms)
-        out=$(timeout $(( short_timeout + 2 )) $YARA_CMD "${yflags2[@]}" "$YARA_TARGET" "$f" 2>/dev/null)
+        out=$(_yara_run $(( short_timeout + 2 )) "${yflags2[@]}" "$YARA_TARGET" "$f" 2>/dev/null)
         t1=$(_now_ms)
         if [ $(( (t1 - t0) / 1000 )) -ge "$short_timeout" ]; then
             # This is the (or a) culprit — report it as a diagnostic entry
@@ -6598,7 +6641,7 @@ process_yara_batch() {
         # timeout. Wrap with the shell's own `timeout` (SIGTERM then
         # SIGKILL at the OS level) as a HARD guarantee that doesn't depend
         # on yara's internal timeout logic working correctly at all.
-        yara_out=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yara_flags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
+        yara_out=$(_yara_run $(( YARA_TIMEOUT_SEC + 3 )) "${yara_flags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
         local t1; t1=$(_now_ms)
         rm -f "$listfile"
 
@@ -6626,7 +6669,7 @@ process_yara_batch() {
         for f in "$@"; do
             ln -sf "$f" "$tmpdir/$(bb basename "$f" 2>/dev/null || basename "$f")_$RANDOM" 2>/dev/null
         done
-        yara_out=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yara_flags[@]}" -r "$YARA_TARGET" "$tmpdir" 2>/dev/null)
+        yara_out=$(_yara_run $(( YARA_TIMEOUT_SEC + 3 )) "${yara_flags[@]}" -r "$YARA_TARGET" "$tmpdir" 2>/dev/null)
         # Symlink names don't map back to real paths 1:1 in this fallback
         # path (RANDOM-suffixed to avoid collisions) — resolve via readlink.
         if [ -n "$yara_out" ]; then
@@ -6792,7 +6835,7 @@ _check_b64_payload() {
         if [ "$HAS_YARA" = true ]; then
             local yara_flags3=(-d filename= -d filepath= -d extension= -p 1 -a "$YARA_TIMEOUT_SEC") yhit
             case "$YARA_TARGET" in *.yarc) yara_flags3+=(-C) ;; esac
-            yhit=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yara_flags3[@]}" "$YARA_TARGET" "$b64tmp" 2>/dev/null | head -1 | awk '{print $1}')
+            yhit=$(_yara_run $(( YARA_TIMEOUT_SEC + 3 )) "${yara_flags3[@]}" "$YARA_TARGET" "$b64tmp" 2>/dev/null | head -1 | awk '{print $1}')
             [ -n "$yhit" ] && threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=${dtype}|yara=${yhit}|b64=${chunk:0:20}..."
         else
             threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=${dtype}|b64=${chunk:0:20}..."
