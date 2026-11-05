@@ -25,7 +25,7 @@
 #   -u, --update            Update signatures and EXIT (no auto-scan after)
 #   -r, --max-ram MB        Max RAM limit in megabytes (default: 500)
 #   -j, --workers N         Number of parallel worker processes (default: auto)
-#   -d, --dir PATH          Target directory to scan (default: /mnt). Must
+#   -d, --dir PATH          Target directory to scan (required). Must
 #                            exist (else exit 2); a symlinked dir (e.g.
 #                            www -> public_html) is scanned at its real
 #                            path. Relative paths in -d/-s/-o/-X/
@@ -379,7 +379,7 @@ WORKER_BASH="bash"
 
 # --- CLI-configured params (defaults, overridable via parse_args) ---
 SIGNATURES="${SCRIPT_DIR}/signatures"
-ROOT_DIR="/mnt"
+ROOT_DIR=""             # no default: a scan requires -d (normalize_args)
 ROOT_DIR_EXPLICIT=""    # set to 1 if -d/--dir was explicitly passed —
                         # lets -P/--scan-processes run standalone (process
                         # scan only, no file tree scan) when -d wasn't given
@@ -1128,7 +1128,7 @@ Examples:
 
 Main options:
   -u, --update          Update signatures and exit (no scan)
-  -d, --dir PATH        Directory to scan (default: /mnt)
+  -d, --dir PATH        Directory to scan (required for a scan)
   -o, --output FILE     Report file (default: reports/av_scan_threats_*.log)
   -q, --quarantine      Move signature hits to quarantine/ (heuristic: report)
   --quarantine-dir PATH Quarantine directory (implies -q; also for --restore)
@@ -1553,6 +1553,7 @@ run_self_setup() {
     else
         build_yara_from_source
     fi
+    local yara_rc=$?
 
     echo ""
     build_grep_from_source
@@ -1569,6 +1570,10 @@ run_self_setup() {
     fi
 
     echo ""
+    if [ "$yara_rc" -ne 0 ]; then
+        echo -e "${R}[FAIL] Setup incomplete: YARA could not be installed (see messages above)${Z}"
+        return 2
+    fi
     echo -e "${G}[OK] Setup complete.${Z} Re-run $0 --help to confirm dependency status."
     return 0
 }
@@ -1576,7 +1581,10 @@ run_self_setup() {
 
 
 parse_args() {
+    local argc
+    set +u  # a trailing "-d" must reach the missing-value check below, not die on unbound $2
     while [[ $# -gt 0 ]]; do
+        argc=$#
         case "$1" in
             -u|--update)     DO_UPDATE=true; shift ;;
             -r|--max-ram)    MAX_RAM_MB="$2"; MAX_RAM_MB_EXPLICIT=1; shift 2 ;;
@@ -1646,9 +1654,12 @@ parse_args() {
             --check-deps)    DO_CHECK_DEPS=true; shift ;;
             -h|--help)       usage ;;
             --help-all)      usage_all ;;
-            *) echo "Unknown parameter: $1"; exit 1 ;;
+            *) echo "Unknown option: $1 (see -h)" >&2; exit 2 ;;
         esac
+        # "shift 2" with no value left fails without shifting (endless loop)
+        [ $# -eq "$argc" ] && { echo "Missing value for option: $1 (see -h)" >&2; exit 2; }
     done
+    set -u
 }
 
 # _abs_path PATH -> absolute, repeated/trailing "/" removed ("/" stays "/"),
@@ -1718,17 +1729,24 @@ normalize_args() {
         printf -v "$name" '%d' "$(( 10#$val ))"
     done
 
-    if [ -z "$ROOT_DIR" ]; then
-        echo -e "${R}[FAIL] -d: empty path${Z}" >&2; exit 2
-    fi
-    ROOT_DIR=$(_abs_path "$ROOT_DIR")
-    if [ -e "$ROOT_DIR" ]; then
-        ROOT_DIR=$(_phys_path "$ROOT_DIR")
-    elif [ -n "$ROOT_DIR_EXPLICIT" ] || { [ "$DO_UPDATE" != true ] && [ "$DO_SETUP" != true ] \
+    if [ -z "$ROOT_DIR_EXPLICIT" ]; then
+        # Modes that run without a file tree; anything else is a scan.
+        if [ "$DO_UPDATE" != true ] && [ "$DO_SETUP" != true ] \
             && [ "$DO_CHECK_DEPS" != true ] && [ -z "$RESTORE_ARG" ] \
-            && [ "$SCAN_PROCESSES" != true ] && [ "$CHECK_KERNEL" != true ]; }; then
-        echo -e "${R}[FAIL] Scan target does not exist: $ROOT_DIR (-d)${Z}" >&2
-        exit 2
+            && [ "$SCAN_PROCESSES" != true ] && [ "$CHECK_KERNEL" != true ]; then
+            echo -e "${R}[FAIL] No scan target: use -d PATH (see -h)${Z}" >&2
+            exit 2
+        fi
+    elif [ -z "$ROOT_DIR" ]; then
+        echo -e "${R}[FAIL] -d: empty path${Z}" >&2; exit 2
+    else
+        ROOT_DIR=$(_abs_path "$ROOT_DIR")
+        if [ -e "$ROOT_DIR" ]; then
+            ROOT_DIR=$(_phys_path "$ROOT_DIR")
+        else
+            echo -e "${R}[FAIL] Scan target does not exist: $ROOT_DIR (-d)${Z}" >&2
+            exit 2
+        fi
     fi
     SIGNATURES=$(_abs_path "$SIGNATURES")
     QUARANTINE_DIR=$(_abs_path "$QUARANTINE_DIR")
@@ -1836,7 +1854,7 @@ init_quarantine() {
 
     # If quarantine is inside the scan target, quarantined files could get
     # rescanned on the next pass (or by real-time watch).
-    case "$QUARANTINE_DIR" in
+    [ -n "$ROOT_DIR" ] && case "$QUARANTINE_DIR" in
         "$ROOT_DIR"/*|"$ROOT_DIR")
             echo -e "${Y}[WARN] Quarantine dir is inside the scan target ($ROOT_DIR) — quarantined files may get rescanned${Z}"
             ;;
@@ -2054,10 +2072,11 @@ update_signatures() {
     echo -e "\033[1;36m[*] Updating signature databases...\033[0m"
 
     # 1. Maldet
+    local got=0  # sources that actually arrived; 0 -> update failed
     echo "[*] Maldet sigpack..."
     net_fetch "https://cdn.rfxn.com/downloads/maldet-sigpack.tgz" "$dl/maldet-sigpack.tgz" 15
     if [ -s "$dl/maldet-sigpack.tgz" ]; then
-        tar -xzf "$dl/maldet-sigpack.tgz" -C "$sig_dir/maldet" --strip-components=1 2>/dev/null || true
+        tar -xzf "$dl/maldet-sigpack.tgz" -C "$sig_dir/maldet" --strip-components=1 2>/dev/null && got=$((got + 1))
         echo "  ✓ Maldet: $(bb find "$sig_dir/maldet" -type f 2>/dev/null | bb wc -l | tr -d ' ') files"
         rm -f "$dl/maldet-sigpack.tgz"
     else
@@ -2074,7 +2093,7 @@ update_signatures() {
     if head -c 11 "$dl/main.cvd" | grep -q "ClamAV-VDB"; then
         dd if="$dl/main.cvd"  bs=512 skip=1 status=none 2>/dev/null | tar -xz -C "$clam_dir" 2>/dev/null || true
         dd if="$dl/daily.cvd" bs=512 skip=1 status=none 2>/dev/null | tar -xz -C "$clam_dir" 2>/dev/null || true
-        echo " ✓ ClamAV unpacked"
+        echo " ✓ ClamAV unpacked"; got=$((got + 1))
     else
         echo " ! ClamAV files are not valid CVD (probably Cloudflare block)"
     fi
@@ -2108,8 +2127,8 @@ update_signatures() {
     if command -v git &>/dev/null; then
         for repo in "https://github.com/Neo23x0/signature-base.git" "https://github.com/Yara-Rules/rules.git"; do
             local name; name=$(basename "$repo" .git)
-            git -C "$yara_dir/$name" pull --quiet 2>/dev/null || \
-                git clone --depth 1 "$repo" "$yara_dir/$name" --quiet 2>/dev/null || true
+            { git -C "$yara_dir/$name" pull --quiet 2>/dev/null || \
+                git clone --depth 1 "$repo" "$yara_dir/$name" --quiet 2>/dev/null; } && got=$((got + 1))
         done
     else
         echo "  ! git not found (outside busybox) -> YARA rule update skipped"
@@ -2142,6 +2161,10 @@ EOF
 # Add your SHA256 hashes (hash<TAB>name)
 EOF
 
+    if [ "$got" -eq 0 ]; then
+        echo -e "\033[0;31m[FAIL] Signature update: no source could be downloaded (network?)\033[0m"
+        return 1
+    fi
     echo -e "\033[1;32m[OK] Signature update finished\033[0m"
     echo "    Size: $(du -sh "$sig_dir" 2>/dev/null | cut -f1)"
     echo ""
@@ -3782,7 +3805,7 @@ check_deps() {
         fi
         command -v "$cmd" &>/dev/null || miss+=("$cmd")
     done
-    [ ${#miss[@]} -gt 0 ] && { echo -e "${R}[FAIL] Missing required tools (not in busybox or system): ${miss[*]}${Z}"; exit 1; }
+    [ ${#miss[@]} -gt 0 ] && { echo -e "${R}[FAIL] Missing required tools (not in busybox or system): ${miss[*]}${Z}"; exit 2; }
 }
 
 # ============================================================================
@@ -4363,6 +4386,19 @@ build_report() {
     fi
     SC=$(count_suppressed)
     SPEED=0; [ "$ELAPSED_S" -gt 0 ] && SPEED=$(( TF / ELAPSED_S ))
+    # No hash signatures and no YARA leaves only a handful of built-in
+    # strings: such a run must not print CLEAN / exit 0 (main exits 2).
+    # YARA counts only with a compiled ruleset (as in yara_self_test) built
+    # from more than our own generated_strings.yar (= those same strings).
+    local hf
+    NO_YARA=1
+    [ "$YARA_CMD" != none ] && { [ -f "$SIG_DIR/yara/rules.yarc" ] || [ -f "$SIG_DIR/yara/index.yar" ]; } \
+        && [ -n "$(bb find "$SIG_DIR/yara" -maxdepth 1 -type f -size +0 \( -name '*.yar' -o -name '*.yara' \) \
+                ! -name index.yar ! -name _index.yar ! -name generated_strings.yar 2>/dev/null)" ] && NO_YARA=0
+    NO_COVERAGE=$NO_YARA
+    for hf in sha256 sha1 md5; do
+        [ -f "$SIG_DIR/$hf.tsv" ] && bb grep -q '^[0-9a-fA-F]' "$SIG_DIR/$hf.tsv" && NO_COVERAGE=0
+    done
 
     # A worker that died (crash, OOM kill, bash error) never writes its
     # .done marker: its share of files went unscanned, so this run must
@@ -4377,10 +4413,10 @@ build_report() {
     local incomplete_line=""
     if [ "$UNFINISHED" -gt 0 ]; then
         incomplete_line="
- INCOMPLETE         : $UNFINISHED worker(s) died — only $TF of ${TOTAL_FILES:-0} queued files scanned"
+ INCOMPLETE         : $UNFINISHED worker(s) died -- only $TF of ${TOTAL_FILES:-0} queued files scanned"
     elif [ "${YARA_SKIPPED:-0}" -gt 0 ]; then
         incomplete_line="
- INCOMPLETE         : ${YARA_SKIPPED} file(s) not checked by YARA (memory limit) — see report"
+ INCOMPLETE         : ${YARA_SKIPPED} file(s) not checked by YARA (memory limit) -- see report"
     elif [ "$TF" -lt "${TOTAL_FILES:-0}" ] 2>/dev/null; then
         incomplete_line="
  Not scanned        : $(( TOTAL_FILES - TF )) of $TOTAL_FILES queued (gone or unreadable when reached)"
@@ -4411,21 +4447,28 @@ build_report() {
     local elapsed_ms=$(( ELAPSED_S * 1000 * (WORKERS > 0 ? WORKERS : 1) ))
     local unaccounted_ms=$(( elapsed_ms - total_batch_ms ))
     [ "$unaccounted_ms" -lt 0 ] && unaccounted_ms=0
-    local timing_line="
+    local timing_line="" time_line speed_line=""
+    [ "${ORPHUS_DEBUG:-}" = 1 ] && timing_line="
  Time breakdown (ms, summed across ${WORKERS} worker(s)):
    hash=${th_ms} yara=${ty_ms} strings/hex=${tu_ms} pe-sections=${tp_ms}
    other/unaccounted=${unaccounted_ms} (per-file checks, I/O wait, overhead)"
+    if [ "$ELAPSED_S" -gt 0 ]; then
+        time_line=$(printf '%02d:%02d' $(( ELAPSED_S/60 )) $(( ELAPSED_S%60 )))
+        speed_line="
+ Avg Speed          : ${SPEED} files/s"
+    else
+        time_line="<1s"
+    fi
 
     RPT="
 =================================================
- SCAN RESULTS  (Oprhus Unified v${VERSION})
+ SCAN RESULTS  (Orphus Unified v${VERSION})
 =================================================
  OS / Arch          : $OS / $ARCH
  Target             : $ROOT_DIR
  Files Scanned      : $TF${incomplete_line}
  Threats Found      : $TT${quarantine_line}${suppressed_line}${skipped_line}
- Time Elapsed       : $(printf '%02d:%02d' $(( ELAPSED_S/60 )) $(( ELAPSED_S%60 )))
- Avg Speed          : ${SPEED} files/s
+ Time Elapsed       : ${time_line}${speed_line}
  Workers            : $WORKERS${timing_line}
 ================================================="
 }
@@ -4448,13 +4491,23 @@ print_report() {
         fi
     elif [ "${UNFINISHED:-0}" -gt 0 ]; then
         echo -e "${Y}${RPT}${Z}"
-        echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${UNFINISHED} worker(s) died before finishing — NOT a clean result (exit 2)${Z}"
+        echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${UNFINISHED} worker(s) died before finishing -- NOT a clean result (exit 2)${Z}"
     elif [ "${YARA_SKIPPED:-0}" -gt 0 ]; then
         echo -e "${Y}${RPT}${Z}"
-        echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${YARA_SKIPPED} file(s) not checked by YARA (memory limit) — NOT a clean result (exit 2)${Z}"
+        echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${YARA_SKIPPED} file(s) not checked by YARA (memory limit) -- NOT a clean result (exit 2)${Z}"
+    elif [ "${NO_COVERAGE:-0}" -gt 0 ]; then
+        echo -e "${Y}${RPT}${Z}"
+        echo -e "\n ${Y}[WARN] INCOMPLETE: no hash signatures and no YARA -- run with -u (and --setup for YARA)${Z}"
     else
         echo -e "${G}${RPT}${Z}"
         echo -e "\n ${G}[OK] No threats detected [CLEAN]${Z}"
+        if [ "${NO_YARA:-0}" -gt 0 ]; then
+            if [ "$YARA_CMD" = none ]; then
+                echo -e " ${Y}[WARN] YARA not available -- YARA/ClamAV rules were not used${Z}"
+            else
+                echo -e " ${Y}[WARN] No YARA rules (run -u) -- YARA/ClamAV rules were not used${Z}"
+            fi
+        fi
     fi
     if [ "$TT" -gt 0 ] && [ "${UNFINISHED:-0}" -gt 0 ]; then
         echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${UNFINISHED} worker(s) died before finishing${Z}"
@@ -4765,8 +4818,8 @@ main() {
     fi
 
     if [ -n "$RESTORE_ARG" ]; then
-        restore_from_quarantine "$RESTORE_ARG"
-        exit $?
+        restore_from_quarantine "$RESTORE_ARG" || exit 2
+        exit 0
     fi
 
     # BusyBox bootstrap must happen before everything else — the signature
@@ -4790,7 +4843,7 @@ main() {
     # --update is a standalone action (like typical AV tools separate
     # update from scan): update signatures, then exit, no auto-scan.
     if [ "$DO_UPDATE" = true ]; then
-        update_signatures "$SIGNATURES" "$MB_KEY"
+        update_signatures "$SIGNATURES" "$MB_KEY" || exit 2
 
         # Compile right away (not a scan — no target files touched) so the
         # persistent cache is fresh immediately and the printed SHA256/MD5/
@@ -4902,12 +4955,14 @@ main() {
         /dev/shm/av_sigs_*) rm -rf "$SIG_DIR" 2>/dev/null ;;
     esac
     # Exit code for cron/monitoring (H9): 0 = clean, 1 = threats found,
-    # 2 = scan incomplete (a worker died; threats take precedence) or the
-    # real-time watch failed.
+    # 2 = error or incomplete scan (a worker died, a file YARA couldn't
+    # check, or no hash signatures and no YARA; threats take precedence)
+    # or the real-time watch failed.
     [ "$REALTIME_MODE" = true ] && exit 2
     [ "${TT:-0}" -gt 0 ] && exit 1
     [ "${UNFINISHED:-0}" -gt 0 ] && exit 2
     [ "${YARA_SKIPPED:-0}" -gt 0 ] && exit 2
+    [ "${NO_COVERAGE:-0}" -gt 0 ] && exit 2
     exit 0
 }
 
