@@ -19,7 +19,7 @@
 # download itself needs system wget/curl (nothing else to fetch busybox with).
 #
 # Usage:
-#   ./av_scan.sh [OPTIONS]
+#   orphus-av.sh [OPTIONS]
 #
 # Options:
 #   -u, --update            Update signatures and EXIT (no auto-scan after)
@@ -35,7 +35,7 @@
 #                            Numeric options take whole numbers only
 #                            (no "10M", "1.5", "1e3"); anything else -> exit 2.
 #   -o, --output FILE       Report file. Written to LIVE as threats are
-#                            found (not just at the end) — if the scan gets
+#                            found (not just at the end) - if the scan gets
 #                            interrupted, whatever's in this file up to
 #                            that point is still valid. Without -o, a
 #                            default <script dir>/reports/
@@ -44,7 +44,7 @@
 #                            discarded). A symlinked -o is refused.
 #                            SUID/SGID findings are written to a SEPARATE
 #                            companion file (same name + "-SUID") instead
-#                            of mixed into this one — on a full-OS scan,
+#                            of mixed into this one - on a full-OS scan,
 #                            standard system binaries alone can produce
 #                            dozens of lines that bury what actually needs
 #                            a look. Only created if there's anything in it.
@@ -60,7 +60,7 @@
 #                            dir are always excluded automatically.
 #   -A, --scan-archives      Look inside archives (.zip/.jar/.tar/.tar.gz/
 #                            .tgz/.tar.bz2/.tar.xz/.gz/.bz2/.xz, plus .7z/
-#                            .rar if 7z/unrar is installed) — off by
+#                            .rar if 7z/unrar is installed) - off by
 #                            default (extraction has real CPU/time cost and
 #                            some risk from malformed/huge archives, hence
 #                            the safety limits below). A detection inside
@@ -72,18 +72,18 @@
 #                            (default: 200)
 #   --archive-ram-max-mb N    Extract archives up to this COMPRESSED size
 #                            straight into RAM (/dev/shm) instead of disk
-#                            — faster, especially on IOPS-capped hosts
+#                            - faster, especially on IOPS-capped hosts
 #                            (default: 50). Bigger archives fall back to
 #                            disk regardless of --archive-max-mb.
 #   --archive-max-extract-mb N Abort extraction past this much decompressed
-#                            data — defense against decompression/zip
+#                            data - defense against decompression/zip
 #                            bombs (default: 500)
 #   --archive-max-depth N     How many nested-archive levels to recurse
 #                            into, e.g. a zip containing a zip (default: 2)
 #   --archive-max-files N     Only scan the first N files inside one
 #                            archive (default: 2000)
 #   --yara-timeout SECONDS    Abort a single yara call after this long
-#                            (default: 30) — protects against a scan
+#                            (default: 30) - protects against a scan
 #                            hanging indefinitely on a pathological file.
 #                            On a timeout, that batch is retried one file
 #                            at a time with a short timeout each: fast
@@ -93,20 +93,20 @@
 #                            stalling the whole scan.
 #   -L, --long-time           Just LOG any single batch call that takes
 #                            longer than --long-time-threshold (default:
-#                            20s) — batch type, elapsed time, and the
-#                            exact file list — to <output>.slow, without
+#                            20s) - batch type, elapsed time, and the
+#                            exact file list - to <output>.slow, without
 #                            aborting or changing scan behavior at all.
 #                            Survives even a successful finish (a separate
 #                            file from the main report, which gets
 #                            overwritten with the clean summary at the
-#                            end) — tail -f it during a scan to watch live.
+#                            end) - tail -f it during a scan to watch live.
 #   --long-time-threshold N   Seconds threshold for -L above (default: 20)
 #   --sandbox-mode MODE       Isolate archive EXTRACTION (the highest-risk
-#                            operation — parsing attacker-controlled zip/
+#                            operation - parsing attacker-controlled zip/
 #                            tar/7z/rar) as defense-in-depth against a bug
 #                            in the extractor itself being exploited by a
 #                            malicious archive. auto|bwrap|unshare|chroot|
-#                            simple|none (default: auto — picks the
+#                            simple|none (default: auto - picks the
 #                            strongest available: bwrap > unshare >
 #                            simple; --sandbox-mode none opts out).
 #                            Rewritten from a person's draft after finding
@@ -117,11 +117,14 @@
 #                            inside the isolated filesystem view).
 #   --no-ram                Force /tmp instead of /dev/shm
 #   --no-busybox            Fully disable busybox (no auto-download, no local
-#                            binary use) — system tools only
+#                            binary use) - system tools only
 #   -b, --busybox PATH      Explicit path to an existing busybox binary
 #   --mb-key KEY            MalwareBazaar Auth-Key (optional)
 #   -q, --quarantine        Enable quarantine mode (default dir: ./quarantine)
 #   --quarantine-dir PATH   Enable quarantine mode with a custom directory
+#   --quarantine-dry-run    Like -q, but only report what WOULD be moved
+#   --no-quarantine-archives  With -q, report (do not move) an archive
+#                            whose member was detected
 #   --quarantine-perm MODE  chmod mode for quarantined files (default: 0400,
 #                            i.e. read-only, not executable)
 #   --restore PATH          Put a quarantined file back (PATH = original
@@ -137,7 +140,7 @@
 #                            mode: new files get scanned automatically
 #                            (inotifywait, or polling as fallback). Also
 #                            auto-enables -I (incremental) and dpkg SUID
-#                            verification (see both below) — real-time's
+#                            verification (see both below) - real-time's
 #                            whole point is running/watching continuously,
 #                            which is exactly when both pay off.
 #   --watch-interval SEC    Polling interval for the fallback watcher (default: 5)
@@ -151,30 +154,26 @@
 #                            package manager's checksum DB (dpkg/rpm) to
 #                            suppress known-legitimate system binaries
 #                            (sudo, su, mount, ...) and flag ones that
-#                            don't match as TAMPERED. Off by default for a
-#                            one-off scan (the common case: no cache, run
-#                            once — dpkg lookups it'll never benefit from
-#                            again aren't worth paying for), auto-on for
-#                            -w where catching a system binary getting
-#                            swapped WHILE something is watching is the
-#                            actual point. Use --no-verify-suid to force
-#                            it off even under -w.
+#                            don't match as TAMPERED. ON by default (only
+#                            files under /usr,/bin,/sbin,/lib,/opt cost a
+#                            package lookup). Use --no-verify-suid for raw,
+#                            unverified SUID/SGID reporting (also under -w).
 #   --low-priority           Renice + ionice this process (and everything
 #                            it spawns) to the lowest CPU/disk priority, and
 #                            default to a single worker unless -j overrides
-#                            — for running unobtrusively alongside other
+#                            - for running unobtrusively alongside other
 #                            services on the same box (e.g. -w in the
 #                            background long-term).
 #   -P, --scan-processes     Check running processes for simple rootkit
 #                            indicators: a process whose backing binary
 #                            was deleted from disk (still running, but
-#                            invisible to any file-based scan — the
+#                            invisible to any file-based scan - the
 #                            classic "malware deletes itself, keeps
 #                            running in memory" case), a live process
 #                            hashing to a known-malware signature, an
 #                            LD_PRELOAD hooking indicator, and a process
 #                            visible in /proc but hidden from `ps`. Can
-#                            run standalone (no -d needed — just checks
+#                            run standalone (no -d needed - just checks
 #                            processes and exits) or alongside a normal
 #                            file scan. Does NOT and cannot reliably catch
 #                            a genuine kernel-level (LKM) rootkit, which
@@ -182,30 +181,30 @@
 #   -K, --check-kernel        Check kernel image / initramfs / loaded
 #                            module (.ko) files against the package
 #                            manager's own recorded checksums (dpkg -V
-#                            logic) — a tampered boot file or a module not
+#                            logic) - a tampered boot file or a module not
 #                            owned by any package is a strong persistence
 #                            indicator. MEANINGLESS RUN AGAINST THE LIVE
 #                            SYSTEM if that system's own kernel is what's
-#                            compromised (same limitation as -P — it can
+#                            compromised (same limitation as -P - it can
 #                            lie to this check too). Only really means
 #                            something paired with --offline-root, run
 #                            from your host's rescue/recovery boot (every
-#                            major provider offers one — the practical
+#                            major provider offers one - the practical
 #                            cloud-VPS equivalent of a LiveCD).
 #   --offline-root PATH       Point every check (including -K, and the
 #                            normal file scan via -d) at a MOUNTED, NOT
-#                            BOOTED disk instead of the live filesystem —
+#                            BOOTED disk instead of the live filesystem -
 #                            e.g. after booting your provider's rescue
 #                            system and mounting the suspect disk at
 #                            /mnt/suspect-root:
-#                              ./av.sh --offline-root /mnt/suspect-root \
+#                              ./orphus-av.sh --offline-root /mnt/suspect-root \
 #                                -K -d /mnt/suspect-root
 #                            This is what makes -K meaningful against a
-#                            real kernel-level rootkit — everything reads
+#                            real kernel-level rootkit - everything reads
 #                            through the RESCUE kernel, not a potentially
 #                            compromised one. Booting into rescue mode
 #                            itself is always a manual step through your
-#                            provider's control panel — nothing here can
+#                            provider's control panel - nothing here can
 #                            or should try to trigger that automatically
 #                            from within a system you don't trust the
 #                            kernel of. Incompatible with -P (no running
@@ -220,34 +219,34 @@
 #   --sig-in-ram              Force the compiled signature set (hash/YARA
 #                            databases) into /dev/shm specifically,
 #                            independent of the general RAM-ceiling
-#                            decision that governs everything else — for
+#                            decision that governs everything else - for
 #                            powerful boxes with room to spare, guarantees
 #                            every batch lookup is a RAM hit instead of
 #                            hoping the OS page cache wasn't evicted.
 #   --deep, --paranoid        One-off scan with maximum scrutiny: turns on
-#                            SUID/SGID package verification and archive
-#                            scanning (both -w-only by default), skips
-#                            incremental-cache shortcuts, and — the main
-#                            point — bypasses EVERY automatic suppression
+#                            archive scanning (-A), raises -m to 200 MB
+#                            unless -m was given explicitly, skips
+#                            incremental-cache shortcuts, and - the main
+#                            point - bypasses EVERY automatic suppression
 #                            mechanism (ignore_sigs, the vendor-
 #                            obfuscation allowlist) so nothing is
 #                            filtered out before you see it. The person
 #                            decides what's a false positive, not the tool.
 #   --max-hex-patterns N    Cap on compiled hex signature patterns (default:
-#                            8000) — grep -E -f cannot build a usable match
+#                            8000) - grep -E -f cannot build a usable match
 #                            automaton from a full real ClamAV .ndb+.ldb set
 #                            (100k+ patterns); raising this trades scan
 #                            speed for hex-signature coverage
-#   --batch-size N            Files per hash/YARA batch (default: 50).
+#   --batch-size N            Files per hash/YARA batch (default: 200).
 #                            Smaller = smoother progress (threats show up
 #                            more incrementally instead of jumping when a
 #                            big batch finishes), at some throughput cost.
-#   --heur-batch-size N       Files per strings/hex heuristic batch (default: 50)
-#   --pe-batch-size N         Files per PE-section/.mdb batch (default: 50)
-#   --setup                  Install yara/yarac into bin/ (and fetch busybox
-#                            if missing), then exit. Prefers --yara-url if
+#   --heur-batch-size N       Files per strings/hex heuristic batch (default: 200)
+#   --pe-batch-size N         Files per PE-section/.mdb batch (default: 100)
+#   --setup                  Install yara/yarac (plus static grep and bash)
+#                            into bin/ (and fetch busybox if missing), then exit. Prefers --yara-url if
 #                            given; otherwise compiles from source (needs a
-#                            C toolchain — auto-installed via whichever of
+#                            C toolchain - auto-installed via whichever of
 #                            apt/dnf/yum/zypper/pacman/apk is present).
 #   --yara-url-sha256 HASH    Expected SHA256 of the --yara-url tarball;
 #                            without it the download is refused.
@@ -255,7 +254,7 @@
 #                            against pinned SHA256; other versions or URLs
 #                            are refused unless ORPHUS_ALLOW_UNPINNED=1.
 #   --yara-url URL            Install yara/yarac from a prebuilt tarball at
-#                            this URL instead of compiling — no compiler
+#                            this URL instead of compiling - no compiler
 #                            needed on the target machine. YARA publishes no
 #                            official prebuilt binaries, so this is meant to
 #                            point at your OWN mirror: build once with
@@ -271,14 +270,15 @@
 #   --setup --force           Reinstall/rebuild even if bin/yara already exists
 #   --check-deps             Print bundled/system/missing status for
 #                            busybox and yara/yarac, then exit
-#   -h, --help               Show this help (also runs --check-deps)
+#   -h, --help               Short help
+#   --help-all               This full reference
 #
-# Exit codes: 0 = clean, 1 = threats found, 2 = error (bad option, missing
-#   -d, ...) or scan incomplete (a worker died before finishing its files;
-#   reported only when no threats were found — 1 wins), 130 = interrupted.
+# Exit codes:
+#   0  clean   1  threats found   2  error or incomplete scan (bad option, missing target, no signatures/YARA, workers died)
+#   1 wins over an incomplete scan; 130 = interrupted.
 #
 # File layout:
-#   1. GLOBALS         — all script variables, defined once here
+#   1. GLOBALS         - all script variables, defined once here
 #   2. MODULE: platform / cpu
 #   3. MODULE: busybox bootstrap (find / auto-download / bb wrapper)
 #   4. MODULE: hash & yara & strings/file detection (busybox-first)
@@ -293,46 +293,46 @@
 #  13. MODULE: progress monitor / cleanup
 #  14. MODULE: reporting
 #  15. MODULE: real-time watch (background daemon)
-#  16. main()          — single entry point, calls modules in order
-#  17. EMBEDDED WORKER  — separate self-contained script (also modular;
+#  16. main()          - single entry point, calls modules in order
+#  17. EMBEDDED WORKER  - separate self-contained script (also modular;
 #                          does the scanning and the actual quarantine)
 #
 # Package layout (for building a distributable archive):
-#   Paths below are relative to SCRIPT_DIR (where av_scan.sh lives). Only
-#   av_scan.sh itself is required; everything else is either bundled or
+#   Paths below are relative to SCRIPT_DIR (where orphus-av.sh lives). Only
+#   orphus-av.sh itself is required; everything else is either bundled or
 #   auto-created on first run.
 #
-#   av_scan/
-#   ├── av_scan.sh              [REQUIRED]
-#   ├── bin/
-#   │   ├── busybox              [RECOMMENDED] static busybox binary
-#   │   │                        (x86_64/arm64/armv7, linux-musl static build)
-#   │   ├── yara                 [RECOMMENDED] built by `av_scan.sh --setup`
-#   │   └── yarac                (not fetched automatically like busybox —
-#   │                            YARA ships no ready static binaries, so
-#   │                            --setup compiles them from source; needs
-#   │                            a C toolchain + network once)
-#   ├── signatures/              [OPTIONAL] signature DB; created by
-#   │   ├── maldet/               update_signatures() on -u if missing, or
-#   │   ├── clamav/                the scanner just runs on built-in
-#   │   ├── hashes/                heuristics without it.
-#   │   ├── yara/
-#   │   ├── strings/
-#   │   ├── custom/
-#   │   │   ├── custom.sha256    [OPTIONAL] own hashes: "hash<TAB>name"
-#   │   │   ├── custom.md5       [OPTIONAL] same for MD5
-#   │   │   └── custom.strings   [OPTIONAL] own string signatures
-#   │   ├── .cache/               [AUTO] persistent compiled cache
-#   │   └── .compiled            [AUTO] compile flag, no need to ship
-#   └── quarantine/              [AUTO, only with -q] auto-created
-#       └── manifest.tsv           auto-created, no need to ship
+#   orphus/
+#   |-- orphus-av.sh              [REQUIRED]
+#   |-- bin/
+#   |   |-- busybox              [RECOMMENDED] static busybox binary
+#   |   |                        (x86_64/arm64/armv7, linux-musl static build)
+#   |   |-- yara                 [RECOMMENDED] built by `orphus-av.sh --setup`
+#   |   `-- yarac                (not fetched automatically like busybox -
+#   |                            YARA ships no ready static binaries, so
+#   |                            --setup compiles them from source; needs
+#   |                            a C toolchain + network once)
+#   |-- signatures/              [OPTIONAL] signature DB; created by
+#   |   |-- maldet/               update_signatures() on -u if missing, or
+#   |   |-- clamav/                the scanner just runs on built-in
+#   |   |-- hashes/                heuristics without it.
+#   |   |-- yara/
+#   |   |-- strings/
+#   |   |-- custom/
+#   |   |   |-- custom.sha256    [OPTIONAL] own hashes: "hash<TAB>name"
+#   |   |   |-- custom.md5       [OPTIONAL] same for MD5
+#   |   |   `-- custom.strings   [OPTIONAL] own string signatures
+#   |   |-- .cache/               [AUTO] persistent compiled cache
+#   |   `-- .compiled            [AUTO] compile flag, no need to ship
+#   `-- quarantine/              [AUTO, only with -q] auto-created
+#       `-- manifest.tsv           auto-created, no need to ship
 #
 #   Temp work dirs (/dev/shm/av_scan_$$ or $TMPDIR/av_scan_$$) are created
-#   and removed by the script each run — not part of the package.
+#   and removed by the script each run - not part of the package.
 #
-#   Minimal fully-offline archive: av_scan.sh + bin/{busybox,yara,yarac}
-#   + signatures/ (pre-populated). Just av_scan.sh alone also works: run
-#   `av_scan.sh --setup` once (needs network + a C toolchain) to build
+#   Minimal fully-offline archive: orphus-av.sh + bin/{busybox,yara,yarac}
+#   + signatures/ (pre-populated). Just orphus-av.sh alone also works: run
+#   `orphus-av.sh --setup` once (needs network + a C toolchain) to build
 #   yara/yarac locally, and busybox auto-downloads on first scan.
 # =============================================================================
 set -uo pipefail
@@ -1119,9 +1119,46 @@ init_toolchain() {
 # 5. MODULE: CLI (usage, argument parsing, colors)
 # ============================================================================
 usage() {
+    cat <<'EOF'
+Orphus AV - malware scanner for Linux web hosting (PHP sites).
+
+Usage: orphus-av.sh [OPTIONS]
+
+Examples:
+  orphus-av.sh -u                          update signatures, then exit
+  orphus-av.sh -d /var/www                 scan a site
+  orphus-av.sh -d /home -q                 scan + quarantine (e.g. nightly cron)
+  orphus-av.sh -d /home -w                 scan, then keep watching new files
+  orphus-av.sh --restore /var/www/x.php    put a quarantined file back
+
+Main options:
+  -u, --update          Update signatures and exit (no scan)
+  -d, --dir PATH        Directory to scan (default: /mnt)
+  -o, --output FILE     Report file (default: reports/av_scan_threats_*.log)
+  -q, --quarantine      Move signature hits to quarantine/ (heuristic: report)
+  --quarantine-dir PATH Quarantine directory (implies -q; also for --restore)
+  --restore PATH        Put a quarantined file back (sha256 check, no overwrite)
+  -w, --real-time       After the scan, watch for new files (implies -I)
+  -X, --exclude PATH    Skip a file or directory (repeatable)
+  -A, --scan-archives   Also look inside zip/tar/gz/... archives (default: off)
+  -m, --max-size MB     Skip deep inspection of bigger files (default: 50)
+  -j, --workers N       Parallel workers (default: CPU count, capped by -r)
+  -r, --max-ram MB      RAM ceiling (default: 500)
+  -I, --incremental     Skip files unchanged since last clean scan
+  --low-priority        Lowest CPU/disk priority, 1 worker unless -j
+  --setup               Install yara/yarac/grep/bash into bin/, then exit
+  --check-deps          Show busybox/yara/grep status, then exit
+
+Exit codes:
+  0  clean   1  threats found   2  error or incomplete scan (bad option, missing target, no signatures/YARA, workers died)
+
+Full option list: --help-all
+EOF
+    exit 0
+}
+
+usage_all() {
     awk '/^# ====/{c++; next} c==1' "$0" | sed 's/^# \{0,2\}//'
-    echo ""
-    check_dependencies_report
     exit 0
 }
 
@@ -1613,6 +1650,7 @@ parse_args() {
             --compile)       SETUP_COMPILE_ONLY=true; shift ;;
             --check-deps)    DO_CHECK_DEPS=true; shift ;;
             -h|--help)       usage ;;
+            --help-all)      usage_all ;;
             *) echo "Unknown parameter: $1"; exit 1 ;;
         esac
     done
