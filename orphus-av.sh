@@ -1164,6 +1164,8 @@ build_yara_from_source() {
 
     local workdir
     workdir=$(mktemp -d 2>/dev/null) || { echo -e "${R}[FAIL] mktemp failed${Z}"; return 1; }
+    local logdir
+    logdir=$(mktemp -d "${TMPDIR:-/tmp}/av_setup_log.XXXXXX" 2>/dev/null) || { echo -e "${R}[FAIL] mktemp failed${Z}"; rm -rf "$workdir"; return 1; }
     echo "[*] Downloading YARA v${version} source..."
     if ! net_fetch "https://github.com/VirusTotal/yara/archive/refs/tags/v${version}.tar.gz" "$workdir/yara.tar.gz" 30; then
         echo -e "${R}[FAIL] Could not download YARA source (network?)${Z}"
@@ -1176,15 +1178,15 @@ build_yara_from_source() {
         cd "$workdir/yara-${version}" || exit 1
         echo "[*] Configuring (static libyara, dynamic libcrypto/libc/libm only)..."
         ./bootstrap.sh >/dev/null 2>&1
-        ./configure --disable-shared --enable-static >/tmp/av_yara_setup_configure.log 2>&1 || exit 1
+        ./configure --disable-shared --enable-static >"$logdir/configure.log" 2>&1 || exit 1
         echo "[*] Building (this can take a minute)..."
-        make -j"$(nproc 2>/dev/null || echo 2)" >/tmp/av_yara_setup_make.log 2>&1 || exit 1
+        make -j"$(nproc 2>/dev/null || echo 2)" >"$logdir/make.log" 2>&1 || exit 1
         strip ./yara ./yarac 2>/dev/null || true
     )
     local build_rc=$?
 
     if [ $build_rc -ne 0 ] || [ ! -x "$workdir/yara-${version}/yara" ]; then
-        echo -e "${R}[FAIL] Build failed — see /tmp/av_yara_setup_configure.log and /tmp/av_yara_setup_make.log${Z}"
+        echo -e "${R}[FAIL] Build failed — see $logdir/configure.log and $logdir/make.log${Z}"
         rm -rf "$workdir"
         return 1
     fi
@@ -1232,6 +1234,8 @@ build_grep_from_source() {
 
     local workdir
     workdir=$(mktemp -d 2>/dev/null) || { echo -e "${R}[FAIL] mktemp failed${Z}"; return 1; }
+    local logdir
+    logdir=$(mktemp -d "${TMPDIR:-/tmp}/av_setup_log.XXXXXX" 2>/dev/null) || { echo -e "${R}[FAIL] mktemp failed${Z}"; rm -rf "$workdir"; return 1; }
     echo "[*] Downloading GNU grep v${version} source..."
     # Multiple official GNU mirrors — ftp.gnu.org occasionally rate-limits
     # or is geo-blocked on some networks; falling through a short mirror
@@ -1259,15 +1263,15 @@ build_grep_from_source() {
     (
         cd "$workdir/grep-${version}" || exit 1
         echo "[*] Configuring (no PCRE -> no external deps -> true static link)..."
-        ./configure --disable-perl-regexp LDFLAGS="-static" >/tmp/av_grep_setup_configure.log 2>&1 || exit 1
+        ./configure --disable-perl-regexp LDFLAGS="-static" >"$logdir/configure.log" 2>&1 || exit 1
         echo "[*] Building..."
-        make -j"$(nproc 2>/dev/null || echo 2)" >/tmp/av_grep_setup_make.log 2>&1 || exit 1
+        make -j"$(nproc 2>/dev/null || echo 2)" >"$logdir/make.log" 2>&1 || exit 1
         strip ./src/grep 2>/dev/null || true
     )
     local build_rc=$?
 
     if [ $build_rc -ne 0 ] || [ ! -x "$workdir/grep-${version}/src/grep" ]; then
-        echo -e "${R}[FAIL] Build failed — see /tmp/av_grep_setup_configure.log and /tmp/av_grep_setup_make.log${Z}"
+        echo -e "${R}[FAIL] Build failed — see $logdir/configure.log and $logdir/make.log${Z}"
         rm -rf "$workdir"
         return 1
     fi
@@ -1320,6 +1324,8 @@ build_bash_from_source() {
 
     local workdir
     workdir=$(mktemp -d 2>/dev/null) || { echo -e "${R}[FAIL] mktemp failed${Z}"; return 1; }
+    local logdir
+    logdir=$(mktemp -d "${TMPDIR:-/tmp}/av_setup_log.XXXXXX" 2>/dev/null) || { echo -e "${R}[FAIL] mktemp failed${Z}"; rm -rf "$workdir"; return 1; }
     echo "[*] Downloading GNU bash v${version} source..."
     local bash_urls=(
         "https://ftp.gnu.org/gnu/bash/bash-${version}.tar.gz"
@@ -1345,15 +1351,15 @@ build_bash_from_source() {
         cd "$workdir/bash-${version}" || exit 1
         echo "[*] Configuring (static link, no NLS — smaller, fewer moving parts)..."
         ./configure --enable-static-link --disable-nls --without-bash-malloc LDFLAGS="-static" \
-            >/tmp/av_bash_setup_configure.log 2>&1 || exit 1
+            >"$logdir/configure.log" 2>&1 || exit 1
         echo "[*] Building..."
-        make -j"$(nproc 2>/dev/null || echo 2)" >/tmp/av_bash_setup_make.log 2>&1 || exit 1
+        make -j"$(nproc 2>/dev/null || echo 2)" >"$logdir/make.log" 2>&1 || exit 1
         strip ./bash 2>/dev/null || true
     )
     local build_rc=$?
 
     if [ $build_rc -ne 0 ] || [ ! -x "$workdir/bash-${version}/bash" ]; then
-        echo -e "${R}[FAIL] Build failed — see /tmp/av_bash_setup_configure.log and /tmp/av_bash_setup_make.log${Z}"
+        echo -e "${R}[FAIL] Build failed — see $logdir/configure.log and $logdir/make.log${Z}"
         rm -rf "$workdir"
         return 1
     fi
@@ -1756,16 +1762,18 @@ update_signatures() {
     local sig_dir="$1"
     local mb_key="${2:-}"
     mkdir -p "$sig_dir"/{maldet,clamav,hashes,yara,strings,custom}
+    local dl
+    dl=$(mktemp -d "${TMPDIR:-/tmp}/av_update.XXXXXX" 2>/dev/null) || { echo "[FAIL] mktemp failed"; return 1; }
 
     echo -e "\033[1;36m[*] Updating signature databases...\033[0m"
 
     # 1. Maldet
     echo "[*] Maldet sigpack..."
-    net_fetch "https://cdn.rfxn.com/downloads/maldet-sigpack.tgz" "/tmp/maldet-sigpack.tgz" 15
-    if [ -s /tmp/maldet-sigpack.tgz ]; then
-        tar -xzf /tmp/maldet-sigpack.tgz -C "$sig_dir/maldet" --strip-components=1 2>/dev/null || true
+    net_fetch "https://cdn.rfxn.com/downloads/maldet-sigpack.tgz" "$dl/maldet-sigpack.tgz" 15
+    if [ -s "$dl/maldet-sigpack.tgz" ]; then
+        tar -xzf "$dl/maldet-sigpack.tgz" -C "$sig_dir/maldet" --strip-components=1 2>/dev/null || true
         echo "  ✓ Maldet: $(bb find "$sig_dir/maldet" -type f 2>/dev/null | bb wc -l | tr -d ' ') files"
-        rm -f /tmp/maldet-sigpack.tgz
+        rm -f "$dl/maldet-sigpack.tgz"
     else
         echo "  ! Maldet download failed (skipped)"
     fi
@@ -1773,21 +1781,22 @@ update_signatures() {
     # 2. ClamAV
     echo "[*] ClamAV databases..."
     local clam_dir="$sig_dir/clamav"
-    net_fetch "https://packages.microsoft.com/clamav/main.cvd" "/tmp/main.cvd" 10 "Mozilla/5.0"
-    net_fetch "https://packages.microsoft.com/clamav/daily.cvd" "/tmp/daily.cvd" 10 "Mozilla/5.0"
-    if [ -s /tmp/main.cvd ] && [ -s /tmp/daily.cvd ]; then
+    net_fetch "https://packages.microsoft.com/clamav/main.cvd" "$dl/main.cvd" 10 "Mozilla/5.0"
+    net_fetch "https://packages.microsoft.com/clamav/daily.cvd" "$dl/daily.cvd" 10 "Mozilla/5.0"
+    if [ -s "$dl/main.cvd" ] && [ -s "$dl/daily.cvd" ]; then
     # Check it's actually a CVD, not an HTML block page from Cloudflare
-    if head -c 11 /tmp/main.cvd | grep -q "ClamAV-VDB"; then
-        dd if=/tmp/main.cvd  bs=512 skip=1 status=none 2>/dev/null | tar -xz -C "$clam_dir" 2>/dev/null || true
-        dd if=/tmp/daily.cvd bs=512 skip=1 status=none 2>/dev/null | tar -xz -C "$clam_dir" 2>/dev/null || true
+    if head -c 11 "$dl/main.cvd" | grep -q "ClamAV-VDB"; then
+        dd if="$dl/main.cvd"  bs=512 skip=1 status=none 2>/dev/null | tar -xz -C "$clam_dir" 2>/dev/null || true
+        dd if="$dl/daily.cvd" bs=512 skip=1 status=none 2>/dev/null | tar -xz -C "$clam_dir" 2>/dev/null || true
         echo " ✓ ClamAV unpacked"
     else
         echo " ! ClamAV files are not valid CVD (probably Cloudflare block)"
     fi
-    rm -f /tmp/main.cvd /tmp/daily.cvd
+    rm -f "$dl/main.cvd" "$dl/daily.cvd"
 	else
     echo " ! ClamAV download failed (skipped)"
 	fi
+    rm -rf "$dl"
 
     # 3. MalwareBazaar (optional; curl+jq are outside busybox, silently
     # skipped if either is missing)
@@ -2840,9 +2849,10 @@ choose_work_dir() {
         local needed=$(( workers * 12 + 60 ))
         local avail
         avail=$(df -m /dev/shm 2>/dev/null | awk 'NR==2{print $4}')
-        [ "${avail:-0}" -ge "$needed" ] && { echo "/dev/shm/av_scan_$$"; return; }
+        # mktemp -d: atomic, 0700, fails if a local user pre-created the path (C1).
+        [ "${avail:-0}" -ge "$needed" ] && mktemp -d "/dev/shm/av_scan_$$_XXXXXX" && return
     fi
-    echo "${TMPDIR:-/tmp}/av_scan_$$"
+    mktemp -d "${TMPDIR:-/tmp}/av_scan_$$_XXXXXX"
 }
 
 _sweep_stale_shm_dirs() {
@@ -2877,7 +2887,7 @@ _sweep_stale_shm_dirs() {
         [ -e "$d" ] || continue
         base=$(basename "$d")
         case "$base" in
-            av_scan_*|av_sigs_*)   pid="${base#av_*_}" ;;
+            av_scan_*|av_sigs_*)   pid="${base#av_*_}"; pid="${pid%%_*}" ;;
             av_arch_*)             pid="${base#av_arch_}"; pid="${pid%%_*}" ;;
             av_chroot.*)           pid="${base#av_chroot.}"; pid="${pid%%.*}" ;;
             av_filtered_*)         pid="${base#av_filtered_}"; pid="${pid%%_*}" ;;
@@ -2889,7 +2899,7 @@ _sweep_stale_shm_dirs() {
 
 init_workdir() {
     _sweep_stale_shm_dirs
-    WORK_DIR=$(choose_work_dir "$USE_RAM" "$WORKERS")
+    WORK_DIR=$(choose_work_dir "$USE_RAM" "$WORKERS") || { echo -e "${R}[FAIL] Cannot create private work dir (mktemp)${Z}"; exit 2; }
     WORKER_FILE="$WORK_DIR/worker.sh"
 
     if [ "$SIG_IN_RAM" = true ] && [ "$OS" = "linux" ] && [ -d /dev/shm ]; then
@@ -2900,7 +2910,7 @@ init_workdir() {
         local sig_needed=300 sig_avail
         sig_avail=$(df -m /dev/shm 2>/dev/null | awk 'NR==2{print $4}')
         if [ "${sig_avail:-0}" -ge "$sig_needed" ]; then
-            SIG_DIR="/dev/shm/av_sigs_$$"
+            SIG_DIR=$(mktemp -d "/dev/shm/av_sigs_$$_XXXXXX") || SIG_DIR="$WORK_DIR/sigs"
         else
             echo -e "${Y}[WARN] --sig-in-ram requested but /dev/shm doesn't have enough free space (need ~${sig_needed}MB, have ${sig_avail:-0}MB) -> falling back to normal placement${Z}"
             SIG_DIR="$WORK_DIR/sigs"
@@ -4240,9 +4250,9 @@ _filter_patterns_file() {
     [ -n "$src" ] && [ -s "$src" ] || { : > "$dst" 2>/dev/null; return; }
     bb grep -v '^[[:space:]]*#' "$src" 2>/dev/null | bb grep -v '^[[:space:]]*$' > "$dst" 2>/dev/null
 }
-_IGNORE_SIGS_FILTERED="$(mktemp "${TMPDIR:-/tmp}/av_filtered_${MAIN_SCRIPT_PID}_XXXXXX" 2>/dev/null || echo "${TMPDIR:-/tmp}/av_filtered_${MAIN_SCRIPT_PID}_ignore_sigs.$$")"
-_GENERIC_OBFUSCATION_FILTERED="$(mktemp "${TMPDIR:-/tmp}/av_filtered_${MAIN_SCRIPT_PID}_XXXXXX" 2>/dev/null || echo "${TMPDIR:-/tmp}/av_filtered_${MAIN_SCRIPT_PID}_generic_obf.$$")"
-_KNOWN_VENDOR_OBFUSCATION_FILTERED="$(mktemp "${TMPDIR:-/tmp}/av_filtered_${MAIN_SCRIPT_PID}_XXXXXX" 2>/dev/null || echo "${TMPDIR:-/tmp}/av_filtered_${MAIN_SCRIPT_PID}_vendor_obf.$$")"
+_IGNORE_SIGS_FILTERED="$(mktemp "${TMPDIR:-/tmp}/av_filtered_${MAIN_SCRIPT_PID}_XXXXXX" 2>/dev/null)" || { echo "[FAIL] mktemp failed" >&2; exit 2; }
+_GENERIC_OBFUSCATION_FILTERED="$(mktemp "${TMPDIR:-/tmp}/av_filtered_${MAIN_SCRIPT_PID}_XXXXXX" 2>/dev/null)" || { echo "[FAIL] mktemp failed" >&2; exit 2; }
+_KNOWN_VENDOR_OBFUSCATION_FILTERED="$(mktemp "${TMPDIR:-/tmp}/av_filtered_${MAIN_SCRIPT_PID}_XXXXXX" 2>/dev/null)" || { echo "[FAIL] mktemp failed" >&2; exit 2; }
 # FIX (real leak found in practice — Ctrl+C during a scan left these
 # behind, growing by 3-per-worker on every subsequent interrupted run):
 # these three live for the worker's WHOLE lifetime (created once here at
@@ -5935,8 +5945,13 @@ run_scan_loop() {
             # Magic filter + YARA decision
             magic_type=$(_bash_file_type "$file")
             skip_deep=false
+            # Skip YARA only when BOTH magic and extension say "image".
+            # Otherwise "GIF89a;<?php ..." saved as .php bypassed YARA (C3).
             case "$magic_type" in
-                JPEG|PNG|GIF) skip_deep=true ;;
+                JPEG|PNG|GIF)
+                    case "${file##*.}" in
+                        [jJ][pP][gG]|[jJ][pP][eE][gG]|[pP][nN][gG]|[gG][iI][fF]) skip_deep=true ;;
+                    esac ;;
             esac
 
             # Extension/magic mismatch override: force full YARA scanning
