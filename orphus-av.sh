@@ -2938,7 +2938,10 @@ EOF
                     resthex = substr(line, 65)
                     if (hexpart ~ /^[0-9a-fA-F]{64}$/ && (resthex == "" || substr(resthex,1,1) == ":")) {
                         split(line, a, ":")
-                        print "SHA256\t" tolower(a[1]) "\t" (a[2] != "" ? a[2] : "Maldet.Hash")
+                        # "hash:size:name" (md5v2.dat) also lands here:
+                        # take the name, not the size.
+                        nm = a[2]; if (nm ~ /^[0-9*]+$/ && a[3] != "") nm = a[3]
+                        print "SHA256\t" tolower(a[1]) "\t" (nm != "" ? nm : "Maldet.Hash")
                         next
                     }
                 }
@@ -2947,7 +2950,8 @@ EOF
                     resthex = substr(line, 33)
                     if (hexpart ~ /^[0-9a-fA-F]{32}$/ && (resthex == "" || substr(resthex,1,1) == ":")) {
                         split(line, a, ":")
-                        print "MD5\t" tolower(a[1]) "\t" (a[2] != "" ? a[2] : "Maldet.Hash")
+                        nm = a[2]; if (nm ~ /^[0-9*]+$/ && a[3] != "") nm = a[3]
+                        print "MD5\t" tolower(a[1]) "\t" (nm != "" ? nm : "Maldet.Hash")
                         next
                     }
                 }
@@ -4525,8 +4529,11 @@ print_report() {
 
 save_report() {
     [ -n "$LIVE_REPORT_FILE" ] || return 0
-    local gaps
+    local gaps qskip
     gaps=$(bb grep -hE '^\[[^]]*\] (Archive (NOT|partly) scanned|YARA skipped)' "$WORK_DIR/reports"/pool_*.txt 2>/dev/null | cut -d' ' -f2- | bb sort -u)
+    # Signature hits that -q did NOT move (system path, symlink, limit,
+    # mv error). Report-only types are skipped by design and not listed.
+    qskip=$(bb grep -hE '^\[[^]]*\] QUARANTINE_(SKIPPED \((system|symlink|limit|path changed)|FAILED)' "$WORK_DIR/reports"/pool_*.txt 2>/dev/null | cut -d' ' -f2- | bb sort -u)
     {
         echo "$RPT"
         [ "$TT" -gt 0 ] && {
@@ -4545,9 +4552,11 @@ save_report() {
         # Coverage gaps the workers logged (worker log lines live only in
         # WORK_DIR otherwise). Not threats: no count, no exit code change.
         [ -n "$gaps" ] && { echo -e "\n=== NOT FULLY SCANNED ==="; echo "$gaps"; }
+        [ -n "$qskip" ] && { echo -e "\n=== NOT QUARANTINED ==="; echo "$qskip"; }
     } > "$LIVE_REPORT_FILE"
     echo -e "\n[*] Report saved: ${C}${LIVE_REPORT_FILE}${Z}"
     [ -n "$gaps" ] && echo -e "${Y}[!] $(printf '%s\n' "$gaps" | wc -l | tr -d ' ') item(s) not fully scanned (archives / YARA limit or error) -- see the report${Z}"
+    [ -n "$qskip" ] && echo -e "${Y}[!] $(printf '%s\n' "$qskip" | wc -l | tr -d ' ') detection(s) not moved to quarantine (e.g. system path) -- see the report${Z}"
 
     # SUID/SGID findings, same source data, separate file — see the
     # comment in init_live_report() for why. Only written if there's
