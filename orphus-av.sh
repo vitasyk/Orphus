@@ -19,13 +19,13 @@
 # download itself needs system wget/curl (nothing else to fetch busybox with).
 #
 # Usage:
-#   ./av_scan.sh [OPTIONS]
+#   orphus-av.sh [OPTIONS]
 #
 # Options:
 #   -u, --update            Update signatures and EXIT (no auto-scan after)
 #   -r, --max-ram MB        Max RAM limit in megabytes (default: 500)
 #   -j, --workers N         Number of parallel worker processes (default: auto)
-#   -d, --dir PATH          Target directory to scan (default: /mnt). Must
+#   -d, --dir PATH          Target directory to scan (required). Must
 #                            exist (else exit 2); a symlinked dir (e.g.
 #                            www -> public_html) is scanned at its real
 #                            path. Relative paths in -d/-s/-o/-X/
@@ -35,7 +35,7 @@
 #                            Numeric options take whole numbers only
 #                            (no "10M", "1.5", "1e3"); anything else -> exit 2.
 #   -o, --output FILE       Report file. Written to LIVE as threats are
-#                            found (not just at the end) — if the scan gets
+#                            found (not just at the end) - if the scan gets
 #                            interrupted, whatever's in this file up to
 #                            that point is still valid. Without -o, a
 #                            default <script dir>/reports/
@@ -44,7 +44,7 @@
 #                            discarded). A symlinked -o is refused.
 #                            SUID/SGID findings are written to a SEPARATE
 #                            companion file (same name + "-SUID") instead
-#                            of mixed into this one — on a full-OS scan,
+#                            of mixed into this one - on a full-OS scan,
 #                            standard system binaries alone can produce
 #                            dozens of lines that bury what actually needs
 #                            a look. Only created if there's anything in it.
@@ -60,7 +60,7 @@
 #                            dir are always excluded automatically.
 #   -A, --scan-archives      Look inside archives (.zip/.jar/.tar/.tar.gz/
 #                            .tgz/.tar.bz2/.tar.xz/.gz/.bz2/.xz, plus .7z/
-#                            .rar if 7z/unrar is installed) — off by
+#                            .rar if 7z/unrar is installed) - off by
 #                            default (extraction has real CPU/time cost and
 #                            some risk from malformed/huge archives, hence
 #                            the safety limits below). A detection inside
@@ -72,18 +72,18 @@
 #                            (default: 200)
 #   --archive-ram-max-mb N    Extract archives up to this COMPRESSED size
 #                            straight into RAM (/dev/shm) instead of disk
-#                            — faster, especially on IOPS-capped hosts
+#                            - faster, especially on IOPS-capped hosts
 #                            (default: 50). Bigger archives fall back to
 #                            disk regardless of --archive-max-mb.
 #   --archive-max-extract-mb N Abort extraction past this much decompressed
-#                            data — defense against decompression/zip
+#                            data - defense against decompression/zip
 #                            bombs (default: 500)
 #   --archive-max-depth N     How many nested-archive levels to recurse
 #                            into, e.g. a zip containing a zip (default: 2)
 #   --archive-max-files N     Only scan the first N files inside one
 #                            archive (default: 2000)
 #   --yara-timeout SECONDS    Abort a single yara call after this long
-#                            (default: 30) — protects against a scan
+#                            (default: 30) - protects against a scan
 #                            hanging indefinitely on a pathological file.
 #                            On a timeout, that batch is retried one file
 #                            at a time with a short timeout each: fast
@@ -93,20 +93,20 @@
 #                            stalling the whole scan.
 #   -L, --long-time           Just LOG any single batch call that takes
 #                            longer than --long-time-threshold (default:
-#                            20s) — batch type, elapsed time, and the
-#                            exact file list — to <output>.slow, without
+#                            20s) - batch type, elapsed time, and the
+#                            exact file list - to <output>.slow, without
 #                            aborting or changing scan behavior at all.
 #                            Survives even a successful finish (a separate
 #                            file from the main report, which gets
 #                            overwritten with the clean summary at the
-#                            end) — tail -f it during a scan to watch live.
+#                            end) - tail -f it during a scan to watch live.
 #   --long-time-threshold N   Seconds threshold for -L above (default: 20)
 #   --sandbox-mode MODE       Isolate archive EXTRACTION (the highest-risk
-#                            operation — parsing attacker-controlled zip/
+#                            operation - parsing attacker-controlled zip/
 #                            tar/7z/rar) as defense-in-depth against a bug
 #                            in the extractor itself being exploited by a
 #                            malicious archive. auto|bwrap|unshare|chroot|
-#                            simple|none (default: auto — picks the
+#                            simple|none (default: auto - picks the
 #                            strongest available: bwrap > unshare >
 #                            simple; --sandbox-mode none opts out).
 #                            Rewritten from a person's draft after finding
@@ -117,11 +117,14 @@
 #                            inside the isolated filesystem view).
 #   --no-ram                Force /tmp instead of /dev/shm
 #   --no-busybox            Fully disable busybox (no auto-download, no local
-#                            binary use) — system tools only
+#                            binary use) - system tools only
 #   -b, --busybox PATH      Explicit path to an existing busybox binary
 #   --mb-key KEY            MalwareBazaar Auth-Key (optional)
 #   -q, --quarantine        Enable quarantine mode (default dir: ./quarantine)
 #   --quarantine-dir PATH   Enable quarantine mode with a custom directory
+#   --quarantine-dry-run    Like -q, but only report what WOULD be moved
+#   --no-quarantine-archives  With -q, report (do not move) an archive
+#                            whose member was detected
 #   --quarantine-perm MODE  chmod mode for quarantined files (default: 0400,
 #                            i.e. read-only, not executable)
 #   --restore PATH          Put a quarantined file back (PATH = original
@@ -137,7 +140,7 @@
 #                            mode: new files get scanned automatically
 #                            (inotifywait, or polling as fallback). Also
 #                            auto-enables -I (incremental) and dpkg SUID
-#                            verification (see both below) — real-time's
+#                            verification (see both below) - real-time's
 #                            whole point is running/watching continuously,
 #                            which is exactly when both pay off.
 #   --watch-interval SEC    Polling interval for the fallback watcher (default: 5)
@@ -151,30 +154,26 @@
 #                            package manager's checksum DB (dpkg/rpm) to
 #                            suppress known-legitimate system binaries
 #                            (sudo, su, mount, ...) and flag ones that
-#                            don't match as TAMPERED. Off by default for a
-#                            one-off scan (the common case: no cache, run
-#                            once — dpkg lookups it'll never benefit from
-#                            again aren't worth paying for), auto-on for
-#                            -w where catching a system binary getting
-#                            swapped WHILE something is watching is the
-#                            actual point. Use --no-verify-suid to force
-#                            it off even under -w.
+#                            don't match as TAMPERED. ON by default (only
+#                            files under /usr,/bin,/sbin,/lib,/opt cost a
+#                            package lookup). Use --no-verify-suid for raw,
+#                            unverified SUID/SGID reporting (also under -w).
 #   --low-priority           Renice + ionice this process (and everything
 #                            it spawns) to the lowest CPU/disk priority, and
 #                            default to a single worker unless -j overrides
-#                            — for running unobtrusively alongside other
+#                            - for running unobtrusively alongside other
 #                            services on the same box (e.g. -w in the
 #                            background long-term).
 #   -P, --scan-processes     Check running processes for simple rootkit
 #                            indicators: a process whose backing binary
 #                            was deleted from disk (still running, but
-#                            invisible to any file-based scan — the
+#                            invisible to any file-based scan - the
 #                            classic "malware deletes itself, keeps
 #                            running in memory" case), a live process
 #                            hashing to a known-malware signature, an
 #                            LD_PRELOAD hooking indicator, and a process
 #                            visible in /proc but hidden from `ps`. Can
-#                            run standalone (no -d needed — just checks
+#                            run standalone (no -d needed - just checks
 #                            processes and exits) or alongside a normal
 #                            file scan. Does NOT and cannot reliably catch
 #                            a genuine kernel-level (LKM) rootkit, which
@@ -182,30 +181,30 @@
 #   -K, --check-kernel        Check kernel image / initramfs / loaded
 #                            module (.ko) files against the package
 #                            manager's own recorded checksums (dpkg -V
-#                            logic) — a tampered boot file or a module not
+#                            logic) - a tampered boot file or a module not
 #                            owned by any package is a strong persistence
 #                            indicator. MEANINGLESS RUN AGAINST THE LIVE
 #                            SYSTEM if that system's own kernel is what's
-#                            compromised (same limitation as -P — it can
+#                            compromised (same limitation as -P - it can
 #                            lie to this check too). Only really means
 #                            something paired with --offline-root, run
 #                            from your host's rescue/recovery boot (every
-#                            major provider offers one — the practical
+#                            major provider offers one - the practical
 #                            cloud-VPS equivalent of a LiveCD).
 #   --offline-root PATH       Point every check (including -K, and the
 #                            normal file scan via -d) at a MOUNTED, NOT
-#                            BOOTED disk instead of the live filesystem —
+#                            BOOTED disk instead of the live filesystem -
 #                            e.g. after booting your provider's rescue
 #                            system and mounting the suspect disk at
 #                            /mnt/suspect-root:
-#                              ./av.sh --offline-root /mnt/suspect-root \
+#                              ./orphus-av.sh --offline-root /mnt/suspect-root \
 #                                -K -d /mnt/suspect-root
 #                            This is what makes -K meaningful against a
-#                            real kernel-level rootkit — everything reads
+#                            real kernel-level rootkit - everything reads
 #                            through the RESCUE kernel, not a potentially
 #                            compromised one. Booting into rescue mode
 #                            itself is always a manual step through your
-#                            provider's control panel — nothing here can
+#                            provider's control panel - nothing here can
 #                            or should try to trigger that automatically
 #                            from within a system you don't trust the
 #                            kernel of. Incompatible with -P (no running
@@ -220,34 +219,34 @@
 #   --sig-in-ram              Force the compiled signature set (hash/YARA
 #                            databases) into /dev/shm specifically,
 #                            independent of the general RAM-ceiling
-#                            decision that governs everything else — for
+#                            decision that governs everything else - for
 #                            powerful boxes with room to spare, guarantees
 #                            every batch lookup is a RAM hit instead of
 #                            hoping the OS page cache wasn't evicted.
 #   --deep, --paranoid        One-off scan with maximum scrutiny: turns on
-#                            SUID/SGID package verification and archive
-#                            scanning (both -w-only by default), skips
-#                            incremental-cache shortcuts, and — the main
-#                            point — bypasses EVERY automatic suppression
+#                            archive scanning (-A), raises -m to 200 MB
+#                            unless -m was given explicitly, skips
+#                            incremental-cache shortcuts, and - the main
+#                            point - bypasses EVERY automatic suppression
 #                            mechanism (ignore_sigs, the vendor-
 #                            obfuscation allowlist) so nothing is
 #                            filtered out before you see it. The person
 #                            decides what's a false positive, not the tool.
 #   --max-hex-patterns N    Cap on compiled hex signature patterns (default:
-#                            8000) — grep -E -f cannot build a usable match
+#                            8000) - grep -E -f cannot build a usable match
 #                            automaton from a full real ClamAV .ndb+.ldb set
 #                            (100k+ patterns); raising this trades scan
 #                            speed for hex-signature coverage
-#   --batch-size N            Files per hash/YARA batch (default: 50).
+#   --batch-size N            Files per hash/YARA batch (default: 200).
 #                            Smaller = smoother progress (threats show up
 #                            more incrementally instead of jumping when a
 #                            big batch finishes), at some throughput cost.
-#   --heur-batch-size N       Files per strings/hex heuristic batch (default: 50)
-#   --pe-batch-size N         Files per PE-section/.mdb batch (default: 50)
-#   --setup                  Install yara/yarac into bin/ (and fetch busybox
-#                            if missing), then exit. Prefers --yara-url if
+#   --heur-batch-size N       Files per strings/hex heuristic batch (default: 200)
+#   --pe-batch-size N         Files per PE-section/.mdb batch (default: 100)
+#   --setup                  Install yara/yarac (plus static grep and bash)
+#                            into bin/ (and fetch busybox if missing), then exit. Prefers --yara-url if
 #                            given; otherwise compiles from source (needs a
-#                            C toolchain — auto-installed via whichever of
+#                            C toolchain - auto-installed via whichever of
 #                            apt/dnf/yum/zypper/pacman/apk is present).
 #   --yara-url-sha256 HASH    Expected SHA256 of the --yara-url tarball;
 #                            without it the download is refused.
@@ -255,7 +254,7 @@
 #                            against pinned SHA256; other versions or URLs
 #                            are refused unless ORPHUS_ALLOW_UNPINNED=1.
 #   --yara-url URL            Install yara/yarac from a prebuilt tarball at
-#                            this URL instead of compiling — no compiler
+#                            this URL instead of compiling - no compiler
 #                            needed on the target machine. YARA publishes no
 #                            official prebuilt binaries, so this is meant to
 #                            point at your OWN mirror: build once with
@@ -271,14 +270,15 @@
 #   --setup --force           Reinstall/rebuild even if bin/yara already exists
 #   --check-deps             Print bundled/system/missing status for
 #                            busybox and yara/yarac, then exit
-#   -h, --help               Show this help (also runs --check-deps)
+#   -h, --help               Short help
+#   --help-all               This full reference
 #
-# Exit codes: 0 = clean, 1 = threats found, 2 = error (bad option, missing
-#   -d, ...) or scan incomplete (a worker died before finishing its files;
-#   reported only when no threats were found — 1 wins), 130 = interrupted.
+# Exit codes:
+#   0  clean   1  threats found   2  error or incomplete scan (bad option, missing target, no signatures/YARA, workers died)
+#   1 wins over an incomplete scan; 130 = interrupted.
 #
 # File layout:
-#   1. GLOBALS         — all script variables, defined once here
+#   1. GLOBALS         - all script variables, defined once here
 #   2. MODULE: platform / cpu
 #   3. MODULE: busybox bootstrap (find / auto-download / bb wrapper)
 #   4. MODULE: hash & yara & strings/file detection (busybox-first)
@@ -293,46 +293,46 @@
 #  13. MODULE: progress monitor / cleanup
 #  14. MODULE: reporting
 #  15. MODULE: real-time watch (background daemon)
-#  16. main()          — single entry point, calls modules in order
-#  17. EMBEDDED WORKER  — separate self-contained script (also modular;
+#  16. main()          - single entry point, calls modules in order
+#  17. EMBEDDED WORKER  - separate self-contained script (also modular;
 #                          does the scanning and the actual quarantine)
 #
 # Package layout (for building a distributable archive):
-#   Paths below are relative to SCRIPT_DIR (where av_scan.sh lives). Only
-#   av_scan.sh itself is required; everything else is either bundled or
+#   Paths below are relative to SCRIPT_DIR (where orphus-av.sh lives). Only
+#   orphus-av.sh itself is required; everything else is either bundled or
 #   auto-created on first run.
 #
-#   av_scan/
-#   ├── av_scan.sh              [REQUIRED]
-#   ├── bin/
-#   │   ├── busybox              [RECOMMENDED] static busybox binary
-#   │   │                        (x86_64/arm64/armv7, linux-musl static build)
-#   │   ├── yara                 [RECOMMENDED] built by `av_scan.sh --setup`
-#   │   └── yarac                (not fetched automatically like busybox —
-#   │                            YARA ships no ready static binaries, so
-#   │                            --setup compiles them from source; needs
-#   │                            a C toolchain + network once)
-#   ├── signatures/              [OPTIONAL] signature DB; created by
-#   │   ├── maldet/               update_signatures() on -u if missing, or
-#   │   ├── clamav/                the scanner just runs on built-in
-#   │   ├── hashes/                heuristics without it.
-#   │   ├── yara/
-#   │   ├── strings/
-#   │   ├── custom/
-#   │   │   ├── custom.sha256    [OPTIONAL] own hashes: "hash<TAB>name"
-#   │   │   ├── custom.md5       [OPTIONAL] same for MD5
-#   │   │   └── custom.strings   [OPTIONAL] own string signatures
-#   │   ├── .cache/               [AUTO] persistent compiled cache
-#   │   └── .compiled            [AUTO] compile flag, no need to ship
-#   └── quarantine/              [AUTO, only with -q] auto-created
-#       └── manifest.tsv           auto-created, no need to ship
+#   orphus/
+#   |-- orphus-av.sh              [REQUIRED]
+#   |-- bin/
+#   |   |-- busybox              [RECOMMENDED] static busybox binary
+#   |   |                        (x86_64/arm64/armv7, linux-musl static build)
+#   |   |-- yara                 [RECOMMENDED] built by `orphus-av.sh --setup`
+#   |   `-- yarac                (not fetched automatically like busybox -
+#   |                            YARA ships no ready static binaries, so
+#   |                            --setup compiles them from source; needs
+#   |                            a C toolchain + network once)
+#   |-- signatures/              [OPTIONAL] signature DB; created by
+#   |   |-- maldet/               update_signatures() on -u if missing, or
+#   |   |-- clamav/                the scanner just runs on built-in
+#   |   |-- hashes/                heuristics without it.
+#   |   |-- yara/
+#   |   |-- strings/
+#   |   |-- custom/
+#   |   |   |-- custom.sha256    [OPTIONAL] own hashes: "hash<TAB>name"
+#   |   |   |-- custom.md5       [OPTIONAL] same for MD5
+#   |   |   `-- custom.strings   [OPTIONAL] own string signatures
+#   |   |-- .cache/               [AUTO] persistent compiled cache
+#   |   `-- .compiled            [AUTO] compile flag, no need to ship
+#   `-- quarantine/              [AUTO, only with -q] auto-created
+#       `-- manifest.tsv           auto-created, no need to ship
 #
 #   Temp work dirs (/dev/shm/av_scan_$$ or $TMPDIR/av_scan_$$) are created
-#   and removed by the script each run — not part of the package.
+#   and removed by the script each run - not part of the package.
 #
-#   Minimal fully-offline archive: av_scan.sh + bin/{busybox,yara,yarac}
-#   + signatures/ (pre-populated). Just av_scan.sh alone also works: run
-#   `av_scan.sh --setup` once (needs network + a C toolchain) to build
+#   Minimal fully-offline archive: orphus-av.sh + bin/{busybox,yara,yarac}
+#   + signatures/ (pre-populated). Just orphus-av.sh alone also works: run
+#   `orphus-av.sh --setup` once (needs network + a C toolchain) to build
 #   yara/yarac locally, and busybox auto-downloads on first scan.
 # =============================================================================
 set -uo pipefail
@@ -379,7 +379,7 @@ WORKER_BASH="bash"
 
 # --- CLI-configured params (defaults, overridable via parse_args) ---
 SIGNATURES="${SCRIPT_DIR}/signatures"
-ROOT_DIR="/mnt"
+ROOT_DIR=""             # no default: a scan requires -d (normalize_args)
 ROOT_DIR_EXPLICIT=""    # set to 1 if -d/--dir was explicitly passed —
                         # lets -P/--scan-processes run standalone (process
                         # scan only, no file tree scan) when -d wasn't given
@@ -388,6 +388,7 @@ MAX_SCAN_MB_EXPLICIT=""  # set to 1 if -m/--max-size was explicitly
                         # passed — lets --deep raise the default without
                         # overriding a person's own explicit choice
 MAX_RAM_MB=500
+MAX_RAM_MB_EXPLICIT=""  # set to 1 by -r/--max-ram: worker cuts then warn, not inform
 OUTPUT_FILE=""
 LIVE_REPORT_FILE=""    # persistent (outside WORK_DIR) file threats are
                         # appended to AS THEY'RE FOUND, so Ctrl+C/SIGTERM
@@ -931,10 +932,10 @@ ensure_busybox() {
     # fallback) means the package is damaged/incomplete, hence WARN/FAIL.
     [ "$ALLOW_BUSYBOX" = true ] || { echo -e "${Y}[INFO] BusyBox disabled (--no-busybox) -> system tools only${Z}"; return 1; }
 
-    find_local_busybox && { echo -e "${G}[OK] Local busybox: $BUSYBOX_BIN${Z}"; return 0; }
+    find_local_busybox && return 0  # the banner's "Tools" line shows the path
 
     echo -e "${R}[WARN] Expected bundled busybox not found at ${SCRIPT_DIR}/bin/busybox${Z}"
-    echo -e "${R}       This is unusual — check the package (file missing or corrupted).${Z}"
+    echo -e "${R}       This is unusual - check the package (file missing or corrupted).${Z}"
 
     if [ "$OS" = "macos" ]; then
         echo -e "${Y}[INFO] macOS: no official static busybox builds -> system tools${Z}"
@@ -1084,7 +1085,7 @@ detect_yarac() {
 }
 
 init_toolchain() {
-    echo -e "[*] Initializing toolchain..."
+    # Silent when healthy: the banner's "Tools" line lists what was picked.
     ensure_busybox
     cache_busybox_applets
 
@@ -1093,35 +1094,66 @@ init_toolchain() {
     SHA1_CMD=$(detect_sha1)
 
     if [ -n "$BUSYBOX_BIN" ] && busybox_has_applet strings; then
-        STRINGS_CMD="$BUSYBOX_BIN strings"; echo -e "${G}[OK] strings : busybox${Z}"
+        STRINGS_CMD="$BUSYBOX_BIN strings"
     elif command -v strings &>/dev/null; then
-        STRINGS_CMD="strings"; echo -e "${Y}[OK] strings : system (fallback)${Z}"
+        STRINGS_CMD="strings"
     else
-        STRINGS_CMD="bash"; echo -e "${Y}[WARN] strings : built-in bash detector${Z}"
+        STRINGS_CMD="bash"  # built-in detector, a normal fallback
     fi
 
     # "file" is not part of busybox; our own magic-bytes detector
     # (_bash_file_type, dd/od based) already covers what we need.
     FILE_CMD="bash"
-    echo -e "${G}[OK] file    : built-in magic-bytes detector${Z}"
 
-    echo -e " SHA256 : ${C}${SHA256_CMD}${Z}"
-    echo -e " MD5    : ${C}${MD5_CMD}${Z}"
-    if [ -n "$BUSYBOX_BIN" ]; then
-        echo -e " BusyBox: ${G}${BUSYBOX_BIN}${Z}"
-    else
-        echo -e " BusyBox: ${Y}not in use (system-only mode)${Z}"
-    fi
-    echo ""
+    [ "$SHA256_CMD" = none ] && echo -e "${R}[WARN] No SHA256 tool (sha256sum/shasum/openssl) -> SHA256 hash signatures are skipped${Z}"
+    [ "$MD5_CMD" = none ] && echo -e "${R}[WARN] No MD5 tool (md5sum/md5/openssl) -> MD5 hash signatures are skipped${Z}"
+    return 0
 }
 
 # ============================================================================
 # 5. MODULE: CLI (usage, argument parsing, colors)
 # ============================================================================
 usage() {
+    cat <<'EOF'
+Orphus AV - malware scanner for Linux web hosting (PHP sites).
+
+Usage: orphus-av.sh [OPTIONS]
+
+Examples:
+  orphus-av.sh -u                          update signatures, then exit
+  orphus-av.sh -d /var/www                 scan a site
+  orphus-av.sh -d /home -q                 scan + quarantine (e.g. nightly cron)
+  orphus-av.sh -d /home -w                 scan, then keep watching new files
+  orphus-av.sh --restore /var/www/x.php    put a quarantined file back
+
+Main options:
+  -u, --update          Update signatures and exit (no scan)
+  -d, --dir PATH        Directory to scan (required for a scan)
+  -o, --output FILE     Report file (default: reports/av_scan_threats_*.log)
+  -q, --quarantine      Move signature hits to quarantine/ (heuristic: report)
+  --quarantine-dir PATH Quarantine directory (implies -q; also for --restore)
+  --restore PATH        Put a quarantined file back (sha256 check, no overwrite)
+  -w, --real-time       After the scan, watch for new files (implies -I)
+  -X, --exclude PATH    Skip a file or directory (repeatable)
+  -A, --scan-archives   Also look inside zip/tar/gz/... archives (default: off)
+  -m, --max-size MB     Skip deep inspection of bigger files (default: 50)
+  -j, --workers N       Parallel workers (default: CPU count, capped by -r)
+  -r, --max-ram MB      RAM ceiling (default: 500)
+  -I, --incremental     Skip files unchanged since last clean scan
+  --low-priority        Lowest CPU/disk priority, 1 worker unless -j
+  --setup               Install yara/yarac/grep/bash into bin/, then exit
+  --check-deps          Show busybox/yara/grep status, then exit
+
+Exit codes:
+  0  clean   1  threats found   2  error or incomplete scan (bad option, missing target, no signatures/YARA, workers died)
+
+Full option list: --help-all
+EOF
+    exit 0
+}
+
+usage_all() {
     awk '/^# ====/{c++; next} c==1' "$0" | sed 's/^# \{0,2\}//'
-    echo ""
-    check_dependencies_report
     exit 0
 }
 
@@ -1521,6 +1553,7 @@ run_self_setup() {
     else
         build_yara_from_source
     fi
+    local yara_rc=$?
 
     echo ""
     build_grep_from_source
@@ -1537,6 +1570,10 @@ run_self_setup() {
     fi
 
     echo ""
+    if [ "$yara_rc" -ne 0 ]; then
+        echo -e "${R}[FAIL] Setup incomplete: YARA could not be installed (see messages above)${Z}"
+        return 2
+    fi
     echo -e "${G}[OK] Setup complete.${Z} Re-run $0 --help to confirm dependency status."
     return 0
 }
@@ -1544,10 +1581,13 @@ run_self_setup() {
 
 
 parse_args() {
+    local argc
+    set +u  # a trailing "-d" must reach the missing-value check below, not die on unbound $2
     while [[ $# -gt 0 ]]; do
+        argc=$#
         case "$1" in
             -u|--update)     DO_UPDATE=true; shift ;;
-            -r|--max-ram)    MAX_RAM_MB="$2"; shift 2 ;;
+            -r|--max-ram)    MAX_RAM_MB="$2"; MAX_RAM_MB_EXPLICIT=1; shift 2 ;;
             -j|--workers)    WORKERS="$2"; WORKERS_EXPLICIT=1; shift 2 ;;
             -d|--dir)        ROOT_DIR="$2"; ROOT_DIR_EXPLICIT=1; shift 2 ;;
             -s|--sigs)       SIGNATURES="$2"; shift 2 ;;
@@ -1613,9 +1653,13 @@ parse_args() {
             --compile)       SETUP_COMPILE_ONLY=true; shift ;;
             --check-deps)    DO_CHECK_DEPS=true; shift ;;
             -h|--help)       usage ;;
-            *) echo "Unknown parameter: $1"; exit 1 ;;
+            --help-all)      usage_all ;;
+            *) echo "Unknown option: $1 (see -h)" >&2; exit 2 ;;
         esac
+        # "shift 2" with no value left fails without shifting (endless loop)
+        [ $# -eq "$argc" ] && { echo "Missing value for option: $1 (see -h)" >&2; exit 2; }
     done
+    set -u
 }
 
 # _abs_path PATH -> absolute, repeated/trailing "/" removed ("/" stays "/"),
@@ -1685,17 +1729,24 @@ normalize_args() {
         printf -v "$name" '%d' "$(( 10#$val ))"
     done
 
-    if [ -z "$ROOT_DIR" ]; then
-        echo -e "${R}[FAIL] -d: empty path${Z}" >&2; exit 2
-    fi
-    ROOT_DIR=$(_abs_path "$ROOT_DIR")
-    if [ -e "$ROOT_DIR" ]; then
-        ROOT_DIR=$(_phys_path "$ROOT_DIR")
-    elif [ -n "$ROOT_DIR_EXPLICIT" ] || { [ "$DO_UPDATE" != true ] && [ "$DO_SETUP" != true ] \
+    if [ -z "$ROOT_DIR_EXPLICIT" ]; then
+        # Modes that run without a file tree; anything else is a scan.
+        if [ "$DO_UPDATE" != true ] && [ "$DO_SETUP" != true ] \
             && [ "$DO_CHECK_DEPS" != true ] && [ -z "$RESTORE_ARG" ] \
-            && [ "$SCAN_PROCESSES" != true ] && [ "$CHECK_KERNEL" != true ]; }; then
-        echo -e "${R}[FAIL] Scan target does not exist: $ROOT_DIR (-d)${Z}" >&2
-        exit 2
+            && [ "$SCAN_PROCESSES" != true ] && [ "$CHECK_KERNEL" != true ]; then
+            echo -e "${R}[FAIL] No scan target: use -d PATH (see -h)${Z}" >&2
+            exit 2
+        fi
+    elif [ -z "$ROOT_DIR" ]; then
+        echo -e "${R}[FAIL] -d: empty path${Z}" >&2; exit 2
+    else
+        ROOT_DIR=$(_abs_path "$ROOT_DIR")
+        if [ -e "$ROOT_DIR" ]; then
+            ROOT_DIR=$(_phys_path "$ROOT_DIR")
+        else
+            echo -e "${R}[FAIL] Scan target does not exist: $ROOT_DIR (-d)${Z}" >&2
+            exit 2
+        fi
     fi
     SIGNATURES=$(_abs_path "$SIGNATURES")
     QUARANTINE_DIR=$(_abs_path "$QUARANTINE_DIR")
@@ -1754,16 +1805,13 @@ init_workers() {
         WORKERS=1
     fi
 
-    echo -e "${B}[*] RAM Guard: ceiling ${C}${MAX_RAM_MB} MB${Z}"
+    local want_workers="$WORKERS"
 
     if [ "$YARA_CMD" != "none" ] && [ -d "$SIGNATURES/yara" ]; then
         local est_yara_mb=120
         local max_safe=$(( MAX_RAM_MB / est_yara_mb ))
         [ "$max_safe" -lt 1 ] && max_safe=1
-        if [ "$WORKERS" -gt "$max_safe" ]; then
-            echo -e "${Y}[WARN] YARA RAM estimate: reducing workers $WORKERS -> $max_safe${Z}"
-            WORKERS=$max_safe
-        fi
+        [ "$WORKERS" -gt "$max_safe" ] && WORKERS=$max_safe
     fi
 
     # Capture the person's ORIGINAL --no-ram preference for archive
@@ -1776,12 +1824,19 @@ init_workers() {
 
     if [ "$MAX_RAM_MB" -le 512 ]; then
         USE_RAM=false
-        if [ "$WORKERS" -gt 4 ]; then
-            echo -e "${Y}[WARN] Low-RAM profile: workers reduced to 4${Z}"
-            WORKERS=4
-        fi
+        [ "$WORKERS" -gt 4 ] && WORKERS=4
     elif [ "$MAX_RAM_MB" -le 1024 ] && [ "$WORKERS" -gt 8 ]; then
         WORKERS=8
+    fi
+
+    # Fitting the DEFAULT ceiling is routine (INFO); overriding the person's own -j/-r is not (WARN).
+    if [ "$WORKERS" -lt "$want_workers" ]; then
+        local msg="workers $want_workers -> $WORKERS to fit the ${MAX_RAM_MB} MB RAM ceiling (raise with -r)"
+        if [ -n "$WORKERS_EXPLICIT$MAX_RAM_MB_EXPLICIT" ]; then
+            echo -e "${Y}[WARN] RAM guard: $msg${Z}"
+        else
+            echo -e "[INFO] RAM guard: $msg"
+        fi
     fi
 }
 
@@ -1799,7 +1854,7 @@ init_quarantine() {
 
     # If quarantine is inside the scan target, quarantined files could get
     # rescanned on the next pass (or by real-time watch).
-    case "$QUARANTINE_DIR" in
+    [ -n "$ROOT_DIR" ] && case "$QUARANTINE_DIR" in
         "$ROOT_DIR"/*|"$ROOT_DIR")
             echo -e "${Y}[WARN] Quarantine dir is inside the scan target ($ROOT_DIR) — quarantined files may get rescanned${Z}"
             ;;
@@ -1827,15 +1882,15 @@ init_ignore_sigs() {
     if [ ! -f "$IGNORE_SIGS_FILE" ]; then
         mkdir -p "$(dirname "$IGNORE_SIGS_FILE")" 2>/dev/null
         cat << 'EOF' > "$IGNORE_SIGS_FILE" 2>/dev/null
-# Oprhus AV Scanner — ignore_sigs
+# Orphus AV Scanner - ignore_sigs
 #
 # One extended-regex (ERE) pattern per line, matched against
 # "TYPE|info|FILEPATH" of each detection, e.g.:
 #   YARA_MATCH|rule=WEBSHELL_PHP_Dynamic_Big|/home/site/upload/engine/init.php
-# A match SUPPRESSES that detection entirely — no log entry, no
+# A match SUPPRESSES that detection entirely - no log entry, no
 # quarantine. Patterns match as substrings anywhere on the line, so a
 # bare "rule=WEBSHELL_PHP_Dynamic_Big" suppresses that rule EVERYWHERE,
-# on every file, on every future scan — including a real webshell on some
+# on every file, on every future scan - including a real webshell on some
 # other site that happens to trip the same rule. Prefer scoping to a path
 # too, e.g. "rule=WEBSHELL_PHP_Dynamic_Big.*/upload/engine/" only
 # suppresses it under that one directory, leaving the rule fully active
@@ -1843,22 +1898,22 @@ init_ignore_sigs() {
 #
 # Use this for signatures/rules that are individually too broad for your
 # specific software (e.g. a CMS that ships obfuscated/encoded core files
-# for license protection — generic webshell-obfuscation heuristics can't
+# for license protection - generic webshell-obfuscation heuristics can't
 # tell that apart from an actual backdoor by pattern alone).
 #
-# Active by default (not commented out) — affects virtually anyone
+# Active by default (not commented out) - affects virtually anyone
 # scanning system binaries, not specific to any one server: the real
 # /usr/sbin/chroot binary (and its snap-packaged duplicates under
 # /snap/core*/*/usr/sbin/chroot) contains the literal string "/bin/sh -i"
 # as part of its own internal fallback-shell logic, not because it's
-# compromised. Scoped to paths ending in /sbin/chroot specifically — the
+# compromised. Scoped to paths ending in /sbin/chroot specifically - the
 # same pattern text on any OTHER file still triggers normally.
 pattern=/bin/sh -i.*/sbin/chroot$
 #
 # Same class of false positive, different universal system file: the
 # netcat-openbsd manual page (/usr/share/man/man1/nc_openbsd.1.gz)
 # documents "-e /bin/sh -i"-style usage examples as part of explaining
-# what the flag does — text content, not an actual reverse shell.
+# what the flag does - text content, not an actual reverse shell.
 # Present on any Debian/Ubuntu box with netcat-openbsd installed.
 pattern=/bin/sh -i.*nc_openbsd\.1\.gz$
 #
@@ -1891,12 +1946,12 @@ init_vendor_obfuscation_allowlist() {
     if [ ! -f "$GENERIC_OBFUSCATION_RULES_FILE" ]; then
         mkdir -p "$(dirname "$GENERIC_OBFUSCATION_RULES_FILE")" 2>/dev/null
         cat << 'EOF' > "$GENERIC_OBFUSCATION_RULES_FILE" 2>/dev/null
-# Oprhus AV Scanner — generic_obfuscation_rules
+# Orphus AV Scanner - generic_obfuscation_rules
 #
 # One ERE pattern per line, matched against a YARA rule NAME. These are
 # rules broad/generic enough ("does this look obfuscated at all") that
 # they can't tell a real backdoor apart from a vendor obfuscating their
-# OWN code (license protection etc) — a match against one of these rule
+# OWN code (license protection etc) - a match against one of these rule
 # names is only auto-suppressed if the SAME file also matches a
 # fingerprint in known_vendor_obfuscation (both conditions required, not
 # either alone). Add more rule names here as you find other overly-broad
@@ -1915,24 +1970,24 @@ EOF
     if [ ! -f "$KNOWN_VENDOR_OBFUSCATION_FILE" ]; then
         mkdir -p "$(dirname "$KNOWN_VENDOR_OBFUSCATION_FILE")" 2>/dev/null
         cat << 'EOF' > "$KNOWN_VENDOR_OBFUSCATION_FILE" 2>/dev/null
-# Oprhus AV Scanner — known_vendor_obfuscation
+# Orphus AV Scanner - known_vendor_obfuscation
 #
-# One ERE pattern per line — a distinctive fingerprint of a SPECIFIC,
+# One ERE pattern per line - a distinctive fingerprint of a SPECIFIC,
 # LEGITIMATE vendor's own code-obfuscation scheme (usually license
 # protection on core files, not malware). Only consulted for files that
-# ALSO matched a rule listed in generic_obfuscation_rules — this file
+# ALSO matched a rule listed in generic_obfuscation_rules - this file
 # alone never suppresses anything by itself. Add a new line per vendor
 # you run into, ideally a string unlikely to appear by accident.
 #
-# NOTE: grep matches line-by-line — "." does NOT cross newlines here, so
+# NOTE: grep matches line-by-line - "." does NOT cross newlines here, so
 # a pattern spanning e.g. a header comment AND a decode call several
 # lines later (real files have a large base64 blob in between) will never
 # match. Keep each pattern to something that appears on ONE line.
 #
-# DataLife Engine (dle-news.ru) — confirmed from real obfuscated core
+# DataLife Engine (dle-news.ru) - confirmed from real obfuscated core
 # files: a "base64_decode" spelled backwards and un-reversed via strrev()
 # at decode time (a deliberate trick to dodge naive "eval(base64_decode"
-# string signatures — which is also exactly why our OWN eval(base64_decode
+# string signatures - which is also exactly why our OWN eval(base64_decode
 # heuristic never caught it either, for what it's worth). Distinctive
 # enough on its own without needing to also match the header line.
 strrev\('edoced_46esab'\)
@@ -1989,7 +2044,7 @@ init_live_report() {
     fi
 
     {
-        echo "# Oprhus AV Scanner — live threat log (updated as threats are found)"
+        echo "# Orphus AV Scanner - live threat log (updated as threats are found)"
         echo "# Target: $ROOT_DIR"
         echo "# Started: $(date 2>/dev/null || echo unknown)"
         echo "# If this scan gets interrupted, whatever is below this line is still valid."
@@ -2017,10 +2072,11 @@ update_signatures() {
     echo -e "\033[1;36m[*] Updating signature databases...\033[0m"
 
     # 1. Maldet
+    local got=0  # sources that actually arrived; 0 -> update failed
     echo "[*] Maldet sigpack..."
     net_fetch "https://cdn.rfxn.com/downloads/maldet-sigpack.tgz" "$dl/maldet-sigpack.tgz" 15
     if [ -s "$dl/maldet-sigpack.tgz" ]; then
-        tar -xzf "$dl/maldet-sigpack.tgz" -C "$sig_dir/maldet" --strip-components=1 2>/dev/null || true
+        tar -xzf "$dl/maldet-sigpack.tgz" -C "$sig_dir/maldet" --strip-components=1 2>/dev/null && got=$((got + 1))
         echo "  ✓ Maldet: $(bb find "$sig_dir/maldet" -type f 2>/dev/null | bb wc -l | tr -d ' ') files"
         rm -f "$dl/maldet-sigpack.tgz"
     else
@@ -2037,7 +2093,7 @@ update_signatures() {
     if head -c 11 "$dl/main.cvd" | grep -q "ClamAV-VDB"; then
         dd if="$dl/main.cvd"  bs=512 skip=1 status=none 2>/dev/null | tar -xz -C "$clam_dir" 2>/dev/null || true
         dd if="$dl/daily.cvd" bs=512 skip=1 status=none 2>/dev/null | tar -xz -C "$clam_dir" 2>/dev/null || true
-        echo " ✓ ClamAV unpacked"
+        echo " ✓ ClamAV unpacked"; got=$((got + 1))
     else
         echo " ! ClamAV files are not valid CVD (probably Cloudflare block)"
     fi
@@ -2071,8 +2127,8 @@ update_signatures() {
     if command -v git &>/dev/null; then
         for repo in "https://github.com/Neo23x0/signature-base.git" "https://github.com/Yara-Rules/rules.git"; do
             local name; name=$(basename "$repo" .git)
-            git -C "$yara_dir/$name" pull --quiet 2>/dev/null || \
-                git clone --depth 1 "$repo" "$yara_dir/$name" --quiet 2>/dev/null || true
+            { git -C "$yara_dir/$name" pull --quiet 2>/dev/null || \
+                git clone --depth 1 "$repo" "$yara_dir/$name" --quiet 2>/dev/null; } && got=$((got + 1))
         done
     else
         echo "  ! git not found (outside busybox) -> YARA rule update skipped"
@@ -2105,6 +2161,10 @@ EOF
 # Add your SHA256 hashes (hash<TAB>name)
 EOF
 
+    if [ "$got" -eq 0 ]; then
+        echo -e "\033[0;31m[FAIL] Signature update: no source could be downloaded (network?)\033[0m"
+        return 1
+    fi
     echo -e "\033[1;32m[OK] Signature update finished\033[0m"
     echo "    Size: $(du -sh "$sig_dir" 2>/dev/null | cut -f1)"
     echo ""
@@ -2239,6 +2299,12 @@ run_awk_parallel() {
         local i
         for i in $(seq 1 $filled); do bar="${bar}#"; done
         for i in $(seq 1 $((width - filled))); do bar="${bar}-"; done
+        # Not a terminal (cron, | tee, > log): no \r redraws, one plain line per 25%.
+        if [ ! -t 2 ]; then
+            [ $(( done * 4 / total )) -ne $(( (done - 1) * 4 / total )) ] &&
+                printf "[*] Compiled %d/%d chunks (%d%%)\n" "$done" "$total" "$percent" >&2
+            return 0
+        fi
         printf "\r[*] [%s] %3d%% (%d/%d) " "$bar" "$percent" "$done" "$total" >&2
     }
 
@@ -3739,7 +3805,7 @@ check_deps() {
         fi
         command -v "$cmd" &>/dev/null || miss+=("$cmd")
     done
-    [ ${#miss[@]} -gt 0 ] && { echo -e "${R}[FAIL] Missing required tools (not in busybox or system): ${miss[*]}${Z}"; exit 1; }
+    [ ${#miss[@]} -gt 0 ] && { echo -e "${R}[FAIL] Missing required tools (not in busybox or system): ${miss[*]}${Z}"; exit 2; }
 }
 
 # ============================================================================
@@ -3780,32 +3846,26 @@ detect_cms() {
 
 print_banner() {
     echo -e "${B}=================================================${Z}"
-    echo -e "${B} Oprhus AV Scanner Unified v${VERSION}${Z}  [OS: $OS | ARCH: $ARCH]"
-    echo -e " RAM Ceiling  : ${C}${MAX_RAM_MB} MB${Z}"
-    echo -e " Workers      : ${C}${WORKERS}${Z}"
-    echo -e " Target       : ${C}${ROOT_DIR}${Z}"
-    echo -e " Signatures   : ${C}${SIGNATURES}${Z}"
-    echo -e " Max size     : ${C}${MAX_SCAN_MB} MB${Z}"
+    echo -e "${B} Orphus AV Scanner Unified v${VERSION}${Z}  [OS: $OS | ARCH: $ARCH]"
+    echo -e " Target     : ${C}${ROOT_DIR}${Z}"
+    echo -e " Signatures : ${C}${SIGNATURES}${Z}"
+    echo -e " Workers    : ${C}${WORKERS}${Z}  (RAM ceiling ${C}${MAX_RAM_MB} MB${Z})"
+    echo -e " Max size   : ${C}${MAX_SCAN_MB} MB${Z}"
     local cms_detected; cms_detected=$(detect_cms "$ROOT_DIR")
-    [ -n "$cms_detected" ] && echo -e " Detected CMS : ${C}${cms_detected}${Z} (informational only — nothing is excluded based on this)"
-    echo -e " SHA256 / MD5 : ${C}${SHA256_CMD} / ${MD5_CMD}${Z}"
-    echo -e " YARA         : ${C}${YARA_CMD}${Z}"
-    echo -e " strings/file : ${C}${STRINGS_CMD} / built-in magic-bytes${Z}"
-    if [ -n "$BUSYBOX_BIN" ]; then
-        echo -e " BusyBox      : ${G}ON${Z} -> ${BUSYBOX_BIN}"
-    elif [ "$ALLOW_BUSYBOX" = false ]; then
-        echo -e " BusyBox      : ${Y}off (--no-busybox, intentional)${Z}"
-    else
-        echo -e " BusyBox      : ${R}MISSING (system-only) — unusual, check the package${Z}"
-    fi
+    [ -n "$cms_detected" ] && echo -e " CMS        : ${C}${cms_detected}${Z} (info only)"
     if [ "$QUARANTINE_ENABLED" = true ]; then
-        echo -e " Quarantine   : ${C}ON -> ${QUARANTINE_DIR} (perm ${QUARANTINE_PERM})${Z}"
+        echo -e " Quarantine : ${C}ON -> ${QUARANTINE_DIR} (perm ${QUARANTINE_PERM})${Z}"
     else
-        echo -e " Quarantine   : off"
+        echo -e " Quarantine : off"
     fi
     if [ "$REALTIME_MODE" = true ]; then
-        echo -e " Real-time    : ${C}ON${Z} (starts after the base scan)"
+        echo -e " Real-time  : ${C}ON${Z} (starts after the base scan)"
     fi
+    # Missing YARA = YARA and converted ClamAV rules don't run: a coverage gap, keep it loud.
+    [ "$YARA_CMD" = none ] && echo -e " YARA       : ${R}NOT AVAILABLE - YARA/ClamAV rules are skipped${Z}"
+    local bb_state="${G}${BUSYBOX_BIN}${Z}"
+    [ -z "$BUSYBOX_BIN" ] && { [ "$ALLOW_BUSYBOX" = false ] && bb_state="${Y}off (--no-busybox)${Z}" || bb_state="${R}MISSING${Z}"; }
+    echo -e " Tools      : sha256=${SHA256_CMD} md5=${MD5_CMD} yara=${YARA_CMD} strings=${STRINGS_CMD} busybox=${bb_state}"
     echo -e "${B}=================================================${Z}"
 }
 
@@ -4125,7 +4185,7 @@ wait_for_workers() {
     local pid
     for pid in "${WORKER_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
     kill "$MONITOR_PID" 2>/dev/null || true
-    tput cnorm 2>/dev/null || true
+    [ ! -t 1 ] || tput cnorm 2>/dev/null || true  # escapes only to a terminal
 }
 
 # ============================================================================
@@ -4133,8 +4193,11 @@ wait_for_workers() {
 # ============================================================================
 show_progress() {
     local prev=0 prev_ms="$START_MS"
-    tput civis 2>/dev/null || true
-    printf '\n\n\n\n\n'
+    # Not a terminal (cron, | tee, > log): no cursor-movement panel, just a
+    # plain status line every 60 s.
+    local tty=false next_line_s=60
+    [ -t 1 ] && tty=true
+    [ "$tty" = true ] && { tput civis 2>/dev/null || true; printf '\n\n\n\n\n'; }
     while true; do
         local now elapsed_ms elapsed_s
         now=$(now_ms)
@@ -4220,6 +4283,15 @@ show_progress() {
         local efmt; efmt=$(printf '%02d:%02d' $(( elapsed_s/60 )) $(( elapsed_s%60 )))
         local tc="$G"; [ "$tt" -gt 0 ] && tc="$R"
 
+        if [ "$tty" != true ]; then
+            if [ "$elapsed_s" -ge "$next_line_s" ]; then
+                printf '[*] Progress: %d/%d files, %d threats, %s elapsed, ETA %s\n' "$tf" "${TOTAL_FILES:-0}" "$tt" "$efmt" "$eta"
+                next_line_s=$(( elapsed_s + 60 ))
+            fi
+            sleep 1
+            continue
+        fi
+
         printf '\033[5A'
         printf '\033[K'"${B}Time     :${Z} %-8s ${C}Workers : %d/%d${Z}\n" "$efmt" "$active" "$WORKERS"
         printf '\033[K'"${B}Files    :${Z} %-8d ${tc}${B}Threats : %d${Z}\n" "$tf" "$tt"
@@ -4257,7 +4329,7 @@ cleanup() {
         fi
     done
     cleanup_realtime
-    tput cnorm 2>/dev/null || true
+    [ ! -t 1 ] || tput cnorm 2>/dev/null || true  # escapes only to a terminal
 
     local found=0
     if [ -n "$LIVE_REPORT_FILE" ] && [ -f "$LIVE_REPORT_FILE" ]; then
@@ -4314,6 +4386,19 @@ build_report() {
     fi
     SC=$(count_suppressed)
     SPEED=0; [ "$ELAPSED_S" -gt 0 ] && SPEED=$(( TF / ELAPSED_S ))
+    # No hash signatures and no YARA leaves only a handful of built-in
+    # strings: such a run must not print CLEAN / exit 0 (main exits 2).
+    # YARA counts only with a compiled ruleset (as in yara_self_test) built
+    # from more than our own generated_strings.yar (= those same strings).
+    local hf
+    NO_YARA=1
+    [ "$YARA_CMD" != none ] && { [ -f "$SIG_DIR/yara/rules.yarc" ] || [ -f "$SIG_DIR/yara/index.yar" ]; } \
+        && [ -n "$(bb find "$SIG_DIR/yara" -maxdepth 1 -type f -size +0 \( -name '*.yar' -o -name '*.yara' \) \
+                ! -name index.yar ! -name _index.yar ! -name generated_strings.yar 2>/dev/null)" ] && NO_YARA=0
+    NO_COVERAGE=$NO_YARA
+    for hf in sha256 sha1 md5; do
+        [ -f "$SIG_DIR/$hf.tsv" ] && bb grep -q '^[0-9a-fA-F]' "$SIG_DIR/$hf.tsv" && NO_COVERAGE=0
+    done
 
     # A worker that died (crash, OOM kill, bash error) never writes its
     # .done marker: its share of files went unscanned, so this run must
@@ -4328,10 +4413,10 @@ build_report() {
     local incomplete_line=""
     if [ "$UNFINISHED" -gt 0 ]; then
         incomplete_line="
- INCOMPLETE         : $UNFINISHED worker(s) died — only $TF of ${TOTAL_FILES:-0} queued files scanned"
+ INCOMPLETE         : $UNFINISHED worker(s) died -- only $TF of ${TOTAL_FILES:-0} queued files scanned"
     elif [ "${YARA_SKIPPED:-0}" -gt 0 ]; then
         incomplete_line="
- INCOMPLETE         : ${YARA_SKIPPED} file(s) not checked by YARA (memory limit) — see report"
+ INCOMPLETE         : ${YARA_SKIPPED} file(s) not checked by YARA (memory limit) -- see report"
     elif [ "$TF" -lt "${TOTAL_FILES:-0}" ] 2>/dev/null; then
         incomplete_line="
  Not scanned        : $(( TOTAL_FILES - TF )) of $TOTAL_FILES queued (gone or unreadable when reached)"
@@ -4362,21 +4447,28 @@ build_report() {
     local elapsed_ms=$(( ELAPSED_S * 1000 * (WORKERS > 0 ? WORKERS : 1) ))
     local unaccounted_ms=$(( elapsed_ms - total_batch_ms ))
     [ "$unaccounted_ms" -lt 0 ] && unaccounted_ms=0
-    local timing_line="
+    local timing_line="" time_line speed_line=""
+    [ "${ORPHUS_DEBUG:-}" = 1 ] && timing_line="
  Time breakdown (ms, summed across ${WORKERS} worker(s)):
    hash=${th_ms} yara=${ty_ms} strings/hex=${tu_ms} pe-sections=${tp_ms}
    other/unaccounted=${unaccounted_ms} (per-file checks, I/O wait, overhead)"
+    if [ "$ELAPSED_S" -gt 0 ]; then
+        time_line=$(printf '%02d:%02d' $(( ELAPSED_S/60 )) $(( ELAPSED_S%60 )))
+        speed_line="
+ Avg Speed          : ${SPEED} files/s"
+    else
+        time_line="<1s"
+    fi
 
     RPT="
 =================================================
- SCAN RESULTS  (Oprhus Unified v${VERSION})
+ SCAN RESULTS  (Orphus Unified v${VERSION})
 =================================================
  OS / Arch          : $OS / $ARCH
  Target             : $ROOT_DIR
  Files Scanned      : $TF${incomplete_line}
  Threats Found      : $TT${quarantine_line}${suppressed_line}${skipped_line}
- Time Elapsed       : $(printf '%02d:%02d' $(( ELAPSED_S/60 )) $(( ELAPSED_S%60 )))
- Avg Speed          : ${SPEED} files/s
+ Time Elapsed       : ${time_line}${speed_line}
  Workers            : $WORKERS${timing_line}
 ================================================="
 }
@@ -4399,13 +4491,23 @@ print_report() {
         fi
     elif [ "${UNFINISHED:-0}" -gt 0 ]; then
         echo -e "${Y}${RPT}${Z}"
-        echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${UNFINISHED} worker(s) died before finishing — NOT a clean result (exit 2)${Z}"
+        echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${UNFINISHED} worker(s) died before finishing -- NOT a clean result (exit 2)${Z}"
     elif [ "${YARA_SKIPPED:-0}" -gt 0 ]; then
         echo -e "${Y}${RPT}${Z}"
-        echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${YARA_SKIPPED} file(s) not checked by YARA (memory limit) — NOT a clean result (exit 2)${Z}"
+        echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${YARA_SKIPPED} file(s) not checked by YARA (memory limit) -- NOT a clean result (exit 2)${Z}"
+    elif [ "${NO_COVERAGE:-0}" -gt 0 ]; then
+        echo -e "${Y}${RPT}${Z}"
+        echo -e "\n ${Y}[WARN] INCOMPLETE: no hash signatures and no YARA -- run with -u (and --setup for YARA)${Z}"
     else
         echo -e "${G}${RPT}${Z}"
         echo -e "\n ${G}[OK] No threats detected [CLEAN]${Z}"
+        if [ "${NO_YARA:-0}" -gt 0 ]; then
+            if [ "$YARA_CMD" = none ]; then
+                echo -e " ${Y}[WARN] YARA not available -- YARA/ClamAV rules were not used${Z}"
+            else
+                echo -e " ${Y}[WARN] No YARA rules (run -u) -- YARA/ClamAV rules were not used${Z}"
+            fi
+        fi
     fi
     if [ "$TT" -gt 0 ] && [ "${UNFINISHED:-0}" -gt 0 ]; then
         echo -e "\n ${R}[WARN] Scan INCOMPLETE: ${UNFINISHED} worker(s) died before finishing${Z}"
@@ -4443,7 +4545,7 @@ save_report() {
     # actually anything to put in it (no empty companion file otherwise).
     if bb grep -q "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null; then
         {
-            echo "# Oprhus AV Scanner — SUID/SGID findings (split out from the main report)"
+            echo "# Orphus AV Scanner - SUID/SGID findings (split out from the main report)"
             echo "# Target: $ROOT_DIR"
             echo ""
             bb grep -h "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | cut -d: -f2- | bb sort -u
@@ -4716,8 +4818,8 @@ main() {
     fi
 
     if [ -n "$RESTORE_ARG" ]; then
-        restore_from_quarantine "$RESTORE_ARG"
-        exit $?
+        restore_from_quarantine "$RESTORE_ARG" || exit 2
+        exit 0
     fi
 
     # BusyBox bootstrap must happen before everything else — the signature
@@ -4741,7 +4843,7 @@ main() {
     # --update is a standalone action (like typical AV tools separate
     # update from scan): update signatures, then exit, no auto-scan.
     if [ "$DO_UPDATE" = true ]; then
-        update_signatures "$SIGNATURES" "$MB_KEY"
+        update_signatures "$SIGNATURES" "$MB_KEY" || exit 2
 
         # Compile right away (not a scan — no target files touched) so the
         # persistent cache is fresh immediately and the printed SHA256/MD5/
@@ -4853,12 +4955,14 @@ main() {
         /dev/shm/av_sigs_*) rm -rf "$SIG_DIR" 2>/dev/null ;;
     esac
     # Exit code for cron/monitoring (H9): 0 = clean, 1 = threats found,
-    # 2 = scan incomplete (a worker died; threats take precedence) or the
-    # real-time watch failed.
+    # 2 = error or incomplete scan (a worker died, a file YARA couldn't
+    # check, or no hash signatures and no YARA; threats take precedence)
+    # or the real-time watch failed.
     [ "$REALTIME_MODE" = true ] && exit 2
     [ "${TT:-0}" -gt 0 ] && exit 1
     [ "${UNFINISHED:-0}" -gt 0 ] && exit 2
     [ "${YARA_SKIPPED:-0}" -gt 0 ] && exit 2
+    [ "${NO_COVERAGE:-0}" -gt 0 ] && exit 2
     exit 0
 }
 
@@ -5149,7 +5253,11 @@ init_worker_state() {
     [ -s "$SIG_DIR/mdb.tsv" ] && HAS_MDB=true
     [ -s "$SIG_DIR/str_sig_map.tsv" ] && HAS_STR_SIG_MAP=true
 
-    if [ -f "$SIG_DIR/yara/rules.yarc" ]; then
+    # Rule files without a yara binary are not YARA coverage: HAS_YARA=true
+    # here switched off the grep string pass while no YARA ever ran.
+    if [ "$YARA_CMD" = "none" ]; then
+        :
+    elif [ -f "$SIG_DIR/yara/rules.yarc" ]; then
         HAS_YARA=true; YARA_TARGET="$SIG_DIR/yara/rules.yarc"
     elif [ -f "$SIG_DIR/yara/index.yar" ]; then
         HAS_YARA=true; YARA_TARGET="$SIG_DIR/yara/index.yar"
