@@ -5198,6 +5198,9 @@ _sandbox_run_bwrap() {
         --ro-bind /usr /usr
         --proc /proc --dev /dev
         --tmpfs /home --tmpfs /root
+        # /tmp before the binds below: mounted after, it hid a target_dir
+        # under /tmp (disk fallback when /dev/shm is small) — H5.
+        --tmpfs /tmp
         --chdir /tmp
         --setenv HOME /tmp --setenv USER nobody
         --uid 65534 --gid 65534
@@ -5211,7 +5214,7 @@ _sandbox_run_bwrap() {
     # The extraction target dir needs to be WRITABLE inside the sandbox
     # (that's the whole point — the extracted files have to land
     # somewhere this worker can then read back out).
-    args+=(--bind "$target_dir" "$target_dir" --tmpfs /tmp)
+    args+=(--bind "$target_dir" "$target_dir")
     # FIX (real bug found in testing): the ARCHIVE FILE ITSELF lives
     # somewhere else entirely (wherever it was found on the scanned
     # tree) — --unshare-all + explicit binds means NOTHING outside those
@@ -5349,21 +5352,24 @@ _sandbox_run_simple() {
     # FIX: sudo often isn't installed at all on minimal VPS images
     # (confirmed missing in testing) — setpriv (util-linux, near-universal
     # on Linux) drops privileges without needing sudo configured at all.
-    local dropper=()
+    local dropper=() owner=""
     if [ "$(id -u)" = "0" ]; then
-        # FIX (real bug found in testing): mktemp -d creates directories
-        # mode 0700 — root-owned, unreadable/unwritable by anyone else.
-        # Dropping to an unprivileged user for extraction WITHOUT first
-        # opening up the target dir means the extraction tool can't write
-        # into it at all, failing silently (confirmed: 0 threats found on
-        # an archive that should have had 1 — extraction produced nothing
-        # because "nobody" had no permission to write there). chmod while
-        # still root, before dropping privileges.
-        chmod 0777 "$target_dir" 2>/dev/null
         if _sandbox_has setpriv; then
             dropper=(setpriv --reuid 65534 --regid 65534 --clear-groups)
+            owner="65534:65534"
         elif _sandbox_has runuser; then
             dropper=(runuser -u "$SANDBOX_USER" --)
+            owner="$SANDBOX_USER"
+        fi
+        # The dropped user must write target_dir (mktemp: root 0700) and
+        # read the staged archive copy. chown, not chmod 0777 — a
+        # world-writable dir lets other local users plant files (H5).
+        if [ -n "$owner" ]; then
+            chown "$owner" "$target_dir" 2>/dev/null
+            # Only our own staging copy (scan_archive), never a site file.
+            case "$archive_src" in
+                */av_arch_*_in.*/*) chown "$owner" "$(dirname "$archive_src")" "$archive_src" 2>/dev/null ;;
+            esac
         fi
     fi
     # FIX: ulimit -v (virtual memory) routinely breaks legitimate binaries
@@ -5393,6 +5399,34 @@ _sandbox_run_simple() {
 # somewhere else entirely on the scanned tree, not under TARGET_DIR.
 # Falls all the way through to running CMD un-sandboxed only for
 # SANDBOX_MODE=none (explicit opt-out, not a silent fallback).
+_SANDBOX_CHECKED=false
+# H5: a mode that can't start (no user namespaces: containers, CloudLinux,
+# user.max_user_namespaces=0) made every extraction produce nothing,
+# silently. Probe once with `true`; fall back to "simple" if it fails.
+_sandbox_resolve() {
+    [ "$_SANDBOX_CHECKED" = true ] && return
+    _SANDBOX_CHECKED=true
+    local want="$SANDBOX_MODE" m d
+    local -a cand
+    case "$want" in
+        none|simple) return ;;
+        auto) cand=(bwrap unshare) ;;
+        bwrap|unshare|chroot) cand=("$want") ;;
+        *) cand=() ;;
+    esac
+    SANDBOX_MODE=simple
+    d=$(mktemp -d "${TMPDIR:-/tmp}/av_arch_${MAIN_SCRIPT_PID}_probe.XXXXXX" 2>/dev/null) || return
+    for m in "${cand[@]}"; do
+        _sandbox_has "$m" || continue
+        if "_sandbox_run_$m" "$d" "" true &>/dev/null; then SANDBOX_MODE="$m"; break; fi
+    done
+    rm -rf "$d"
+    if [ "$want" != auto ] && [ "$SANDBOX_MODE" != "$want" ]; then
+        echo "[WARN] --sandbox-mode $want does not work here -- archives are extracted in 'simple' mode" >&2
+        log "Sandbox mode '$want' unavailable, using simple"
+    fi
+}
+
 run_sandboxed() {
     local target_dir="$1" archive_src="$2"; shift 2
     local mode="$SANDBOX_MODE"
@@ -5641,6 +5675,19 @@ scan_archive() {
     # keeping this simple matters more than pruning it precisely.
     _ACTIVE_EXTRACT_DIRS+=("$extract_dir")
 
+    # H5: extract from a root-made private copy, not the site's file — a
+    # privilege-dropped sandbox can't read a 0600 archive owned by the site
+    # user, and bwrap/chroot then bind only this copy's dir, not the site's.
+    local stage_dir staged
+    stage_dir=$(mktemp -d "${extract_dir}_in.XXXXXX" 2>/dev/null) || { rm -rf "$extract_dir"; return; }
+    _ACTIVE_EXTRACT_DIRS+=("$stage_dir")
+    staged="$stage_dir/${cur##*/}"
+    if ! cp -- "$cur" "$staged" 2>/dev/null; then
+        rm -rf "$extract_dir" "$stage_dir"; return
+    fi
+    chmod 0400 "$staged" 2>/dev/null
+    _sandbox_resolve
+
     # FIX (real gap found in security review): this used to let
     # _archive_extract run to full completion, ONLY checking the total
     # size AFTERWARD — for a genuine decompression bomb (a small archive
@@ -5652,7 +5699,7 @@ scan_archive() {
     # interval means some overshoot is still possible (whatever gets
     # written in that window), but this bounds it to roughly one second's
     # worth of writes instead of "however big the bomb actually is".
-    _archive_extract "$cur" "$atype" "$extract_dir" &
+    _archive_extract "$staged" "$atype" "$extract_dir" &
     local extract_pid=$! bomb_killed=false extracted_kb=0
     while kill -0 "$extract_pid" 2>/dev/null; do
         extracted_kb=$(du -sk "$extract_dir" 2>/dev/null | awk '{print $1}')
@@ -5668,6 +5715,7 @@ scan_archive() {
         sleep 1
     done
     wait "$extract_pid" 2>/dev/null
+    rm -rf "$stage_dir"
 
     extracted_kb=$(du -sk "$extract_dir" 2>/dev/null | awk '{print $1}')
     if [ "$bomb_killed" = true ]; then
