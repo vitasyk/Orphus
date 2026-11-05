@@ -116,7 +116,11 @@
 #   --quarantine-dir PATH   Enable quarantine mode with a custom directory
 #   --quarantine-perm MODE  chmod mode for quarantined files (default: 0400,
 #                            i.e. read-only, not executable)
-#   -w, --real-time         After the base scan, switch to background watch
+#   --quarantine-max N      Stop moving files after N per worker (default
+#                            100). Only signature hits (hash/YARA/ClamAV/
+#                            string/hex) are moved; heuristic findings,
+#                            symlinks and system paths are report-only.
+#   -w, --real-time        After the base scan, switch to background watch
 #                            mode: new files get scanned automatically
 #                            (inotifywait, or polling as fallback). Also
 #                            auto-enables -I (incremental) and dpkg SUID
@@ -193,6 +197,13 @@
 #                            from within a system you don't trust the
 #                            kernel of. Incompatible with -P (no running
 #                            processes to inspect on an unmounted disk).
+#   --clamd                   Also scan every file with a running ClamAV
+#                            daemon (clamdscan --fdpass): exact ClamAV
+#                            engine and its own freshclam-updated DB.
+#                            Needs clamd installed and running.
+#   --clam-windows            Also convert ClamAV content rules for Windows
+#                            files (PE/OLE2). Default: only rules for any
+#                            file, ELF, HTML and text (Linux/web hosting).
 #   --sig-in-ram              Force the compiled signature set (hash/YARA
 #                            databases) into /dev/shm specifically,
 #                            independent of the general RAM-ceiling
@@ -387,6 +398,9 @@ DO_UPDATE=false
 USE_RAM=true
 ARCHIVE_USE_RAM=true   # captured separately from USE_RAM — see comment
                         # where it's set, in init_workers()
+CLAMD_SCAN=false       # --clamd: also scan every file with a running clamd
+CLAM_WINDOWS=false     # --clam-windows: also convert ClamAV Windows (PE/OLE2)
+                       # content rules; default converts only Linux/web ones
 SIG_IN_RAM=false       # --sig-in-ram: force the COMPILED signature set
                         # (sha256.tsv/md5.tsv/rules.yarc/mdb.tsv — can be
                         # tens to a couple hundred MB for a real
@@ -495,6 +509,7 @@ QUARANTINE_SKIP_ARCHIVES=false  # --no-quarantine-archives: when a threat
                         # normal but leaves the container in place,
                         # letting a person review and decide by hand.
 QUARANTINE_DIR="${SCRIPT_DIR}/quarantine"
+QUARANTINE_MAX=100       # --quarantine-max N: stop moving files after N per worker
 QUARANTINE_PERM="0400"   # read-only, not executable (NOT literal "100" —
                           # that means --x------, the opposite)
 
@@ -1436,6 +1451,8 @@ parse_args() {
             -K|--check-kernel)   CHECK_KERNEL=true; shift ;;
             --offline-root)      OFFLINE_ROOT="$2"; shift 2 ;;
             --sig-in-ram)        SIG_IN_RAM=true; shift ;;
+            --clam-windows)      CLAM_WINDOWS=true; shift ;;
+            --clamd)             CLAMD_SCAN=true; shift ;;
             --deep|--paranoid)   SUID_VERIFY_MODE=true; SCAN_ARCHIVES=true; DEEP_MODE=true
                                  # Real gap found: the default 10MB deep-
                                  # inspection cap (hash/YARA/strings ALL
@@ -1460,6 +1477,7 @@ parse_args() {
             --no-quarantine-archives) QUARANTINE_SKIP_ARCHIVES=true; shift ;;
             --quarantine-dir)  QUARANTINE_ENABLED=true; QUARANTINE_DIR="$2"; shift 2 ;;
             --quarantine-perm) QUARANTINE_PERM="$2"; shift 2 ;;
+            --quarantine-max)  QUARANTINE_MAX="$2"; shift 2 ;;
             -w|--real-time|--realtime) REALTIME_MODE=true; shift ;;
             --low-priority|--background|--bg) LOW_PRIORITY=true; shift ;;
             -I|--incremental)  INCREMENTAL_MODE=true; shift ;;
@@ -2105,6 +2123,7 @@ compile_signatures() {
     # effect for anyone reusing an existing signatures/ directory. Now the
     # cache is also invalidated whenever VERSION doesn't match what it was
     # compiled with.
+    local cache_tag="$VERSION clamwin=$CLAM_WINDOWS"
     local cached_version=""
     [ -f "$version_flag" ] && cached_version=$(cat "$version_flag" 2>/dev/null)
 
@@ -2127,7 +2146,7 @@ compile_signatures() {
             -newer "$compiled_flag" -print -quit 2>/dev/null)
     fi
 
-    if [ "$DO_UPDATE" != true ] && [ -f "$compiled_flag" ] && [ -z "$newest_src" ] && [ "$cached_version" = "$VERSION" ]; then
+    if [ "$DO_UPDATE" != true ] && [ -f "$compiled_flag" ] && [ -z "$newest_src" ] && [ "$cached_version" = "$cache_tag" ]; then
         echo -e "[*] Signatures already compiled -> reusing cache ($cache_dir)"
         mkdir -p "$out_dir"
         cp -f "$cache_dir"/sha256.tsv "$cache_dir"/sha1.tsv "$cache_dir"/md5.tsv "$cache_dir"/hex_ere.txt \
@@ -2136,8 +2155,8 @@ compile_signatures() {
         [ -d "$cache_dir/yara" ] && cp -rf "$cache_dir/yara" "$out_dir/" 2>/dev/null
         return 0
     fi
-    [ -n "$cached_version" ] && [ "$cached_version" != "$VERSION" ] && \
-        echo -e "${Y}[*] av.sh version changed ($cached_version -> $VERSION) -> recompiling signatures${Z}"
+    [ -n "$cached_version" ] && [ "$cached_version" != "$cache_tag" ] && \
+        echo -e "${Y}[*] av.sh version/options changed ($cached_version -> $cache_tag) -> recompiling signatures${Z}"
 
     echo -e "[*] Compiling signatures into flat artifacts..."
 
@@ -2266,63 +2285,117 @@ EOF
     # [n-] / [0-m] / ( aa | bb ) alternation groups). Unlike the old ERE
     # path, jump distances stay EXACT — YARA is built to handle this at
     # scale, so there is no need to loosen them to "any distance".
-    local ndb2yara_fn='
-        function ndb2yara(raw,    s, out, i, c, n, buf, j, spec, inner, alts, cnt, k, a, pa, m, alt_out) {
+    local clam_win=0
+    [ "$CLAM_WINDOWS" = true ] && clam_win=1
+    local ndb2yara_fn="BEGIN { CLAM_WIN = $clam_win }"'
+        # ClamAV -> YARA helpers. Every helper returns "" when the input
+        # cannot be mapped EXACTLY; the caller then skips the rule and
+        # prints "SKIP<TAB>reason" so the skip is counted, not silent (C6).
+        function clam_hex2yara(raw,    s, n, i, c, p, j, spec, inner, cnt, alts, k, a, m, alt_out, out, lit, j2) {
             s = tolower(raw)
-            gsub(/[ \t]+/, "", s)
-            n = length(s)
-            out = ""
-            buf = ""
-            i = 1
+            gsub(/[ \t]/, "", s)
+            n = length(s); out = ""; lit = 0; i = 1
             while (i <= n) {
                 c = substr(s, i, 1)
-                if (substr(s, i, 2) == "??") {
-                    out = out "?? "
+                if (c ~ /[0-9a-f?]/) {
+                    p = substr(s, i, 2)
+                    if (p !~ /^[0-9a-f?][0-9a-f?]$/) return ""
+                    out = out p " "
+                    if (p ~ /^[0-9a-f][0-9a-f]$/) lit++
                     i += 2
                 } else if (c == "*") {
-                    out = out "[0-] "
-                    i += 1
-                } else if (c == "{") {
-                    j = index(substr(s, i), "}")
-                    if (j == 0) { i = n + 1 } else {
-                        spec = substr(s, i + 1, j - 2)
-                        if (spec ~ /^[0-9]+$/) out = out "[" spec "] "
-                        else if (spec ~ /^[0-9]+-[0-9]+$/) out = out "[" spec "] "
-                        else if (spec ~ /^[0-9]+-$/) out = out "[" spec "] "
-                        else if (spec ~ /^-[0-9]+$/) out = out "[0" spec "] "
-                        i += j
-                    }
+                    out = out "[-] "; i++
+                } else if (c == "{" || c == "[") {
+                    j = index(substr(s, i), (c == "{" ? "}" : "]"))
+                    if (j == 0) return ""
+                    spec = substr(s, i + 1, j - 2)
+                    if (spec == "0" || spec == "0-0") { }
+                    else if (spec ~ /^[0-9]+$/ || spec ~ /^[0-9]+-[0-9]+$/) out = out "[" spec "] "
+                    else if (c == "{" && spec ~ /^[0-9]+-$/) out = out "[" spec "] "
+                    else if (c == "{" && spec ~ /^-[0-9]+$/) out = out "[0" spec "] "
+                    else return ""
+                    i += j
                 } else if (c == "(") {
                     j = index(substr(s, i), ")")
-                    if (j == 0) { i = n + 1 } else {
-                        inner = substr(s, i + 1, j - 2)
-                        cnt = split(inner, alts, "|")
-                        alt_out = ""
-                        for (k = 1; k <= cnt; k++) {
-                            a = alts[k]
-                            pa = ""
-                            for (m = 1; m <= length(a); m += 2) pa = pa substr(a, m, 2) " "
-                            gsub(/ +$/, "", pa)
-                            alt_out = (alt_out == "" ? pa : alt_out " | " pa)
-                        }
-                        out = out "( " alt_out " ) "
-                        i += j
+                    if (j == 0) return ""
+                    inner = substr(s, i + 1, j - 2)
+                    cnt = split(inner, alts, "|")
+                    if (cnt < 2) return ""
+                    alt_out = ""
+                    for (k = 1; k <= cnt; k++) {
+                        a = alts[k]
+                        if (a == "" || length(a) % 2 || a !~ /^[0-9a-f?]+$/) return ""
+                        m = ""
+                        for (j2 = 1; j2 <= length(a); j2 += 2) m = m substr(a, j2, 2) " "
+                        sub(/ $/, "", m)
+                        alt_out = (alt_out == "" ? m : alt_out " | " m)
                     }
-                } else if (c ~ /[0-9a-f]/) {
-                    buf = buf c
-                    if (length(buf) == 2) { out = out buf " "; buf = "" }
-                    i += 1
-                } else {
-                    i += 1
-                }
+                    out = out "( " alt_out " ) "
+                    i += j
+                } else return ""
             }
-            gsub(/ +$/, "", out)
-            return out
+            sub(/ $/, "", out)
+            # YARA forbids a hex string that starts or ends with a jump/wildcard.
+            if (out ~ /^\[/ || out ~ /\]$/ || out ~ /^\?\?/ || out ~ /\?\?$/) return ""
+            if (lit < 3) return ""
+            return "{ " out " }"
         }
-        function yara_rule_name(base,    r) {
-            r = base
+        # Hex -> quoted text string, only if every byte is a plain printable
+        # literal (needed for ::i/::w/::a/::f, which YARA hex strings lack).
+        function clam_hex2text(raw,    s, i, b, out) {
+            s = tolower(raw)
+            if (s !~ /^[0-9a-f]+$/ || length(s) % 2 || length(s) < 6) return ""
+            out = ""
+            for (i = 1; i <= length(s); i += 2) {
+                b = HEXV[substr(s, i, 1)] * 16 + HEXV[substr(s, i + 1, 1)]
+                if (b < 32 || b > 126) return ""
+                if (b == 34) out = out "\\\""
+                else if (b == 92) out = out "\\\\"
+                else out = out sprintf("%c", b)
+            }
+            return "\"" out "\""
+        }
+        # Target type -> YARA magic check. "SKIP" = not wanted / not mappable.
+        # 0 any, 3 HTML, 7 ASCII: no magic (HTML/ASCII are matched raw here,
+        # ClamAV matches them normalized -> approximate). 6 ELF. 1 PE and
+        # 2 OLE2 only with --clam-windows.
+        function clam_target(t) {
+            if (t == "" || t == "0" || t == "3" || t == "7") return ""
+            if (t == "6") return "uint32(0) == 0x464C457F"
+            if (t == "1" && CLAM_WIN) return "uint16(0) == 0x5A4D"
+            if (t == "2" && CLAM_WIN) return "uint32(0) == 0xE011CFD0"
+            return "SKIP"
+        }
+        # ClamAV offset -> YARA string condition for $id. "" = unsupported.
+        function clam_offset(off, id,    o, sh, base, p) {
+            if (off == "*" || off == "") return id
+            sh = ""
+            p = index(off, ",")
+            if (p) { sh = substr(off, p + 1); o = substr(off, 1, p - 1) } else o = off
+            if (sh != "" && sh !~ /^[0-9]+$/) return ""
+            if (o ~ /^[0-9]+$/) base = o
+            else if (o ~ /^eof-[0-9]+$/ || o ~ /^EOF-[0-9]+$/) base = "filesize-" substr(o, 5)
+            else return ""
+            if (sh == "") return "(" id " at " base ")"
+            return "(" id " in (" base ".." base "+" sh "))"
+        }
+        function clam_rule_name(kind, name,    r, fn) {
+            r = name
             gsub(/[^a-zA-Z0-9_]/, "_", r)
-            return "s_" r
+            r = substr(r, 1, 90)
+            fn = FILENAME
+            sub(/.*\//, "", fn)
+            gsub(/[^a-zA-Z0-9_]/, "_", fn)
+            return "clam_" r "_" kind fn "_" NR
+        }
+        function clam_meta(name,    m) {
+            m = name
+            gsub(/["\\]/, "", m)
+            return "meta: clamav = \"" m "\" "
+        }
+        BEGIN {
+            for (i = 0; i < 10; i++) HEXV[i ""] = i
+            HEXV["a"] = 10; HEXV["b"] = 11; HEXV["c"] = 12; HEXV["d"] = 13; HEXV["e"] = 14; HEXV["f"] = 15
         }
     '
 
@@ -2409,14 +2482,18 @@ EOF
         run_awk_parallel "$tmp_ndb" "$tmp_ndb_out" "$ndb2yara_fn"'
             {
                 line = $0
-                sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
+                sub(/^[ \t]+/, "", line); sub(/[ \t\r]+$/, "", line)
                 if (line == "" || line ~ /^#/) next
                 n = split(line, a, ":")
-                if (n < 4) next
-                yhex = ndb2yara(a[4])
-                if (yhex == "" || length(yhex) < 8) next
-                rname = yara_rule_name("ndb_" FILENAME "_" NR)
-                print "YARARULE\trule " rname " { strings: $a = { " yhex " } condition: $a }"
+                if (n < 4) { print "SKIP\tndb_format"; next }
+                tc = clam_target(a[2])
+                if (tc == "SKIP") { print "SKIP\tndb_target_" a[2]; next }
+                yhex = clam_hex2yara(a[4])
+                if (yhex == "") { print "SKIP\tndb_hex"; next }
+                sc = clam_offset(a[3], "$a")
+                if (sc == "") { print "SKIP\tndb_offset"; next }
+                cond = (tc == "" ? sc : tc " and " sc)
+                print "YARARULE\trule " clam_rule_name("n", a[1]) " { " clam_meta(a[1]) "strings: $a = " yhex " condition: " cond " }"
             }
         '
         cat "$tmp_ndb_out" >> "$tmp_raw_sigs"
@@ -2434,42 +2511,85 @@ EOF
         local tmp_ldb="$out_dir/cat_ldb.tmp" tmp_ldb_out="$out_dir/cat_ldb.out"
         cat "${ldb_files[@]}" > "$tmp_ldb"
         run_awk_parallel "$tmp_ldb" "$tmp_ldb_out" "$ndb2yara_fn"'
-            function translate_condition(expr,    out2, j, L, ch, numstr) {
-                out2 = ""
-                j = 1
-                L = length(expr)
+            {
+                line = $0
+                sub(/^[ \t]+/, "", line); sub(/[ \t\r]+$/, "", line)
+                if (line == "" || line ~ /^#/) next
+                # Real format: Name;TargetDescriptionBlock;LogicalExpression;Subsig0;Subsig1;...
+                n = split(line, a, ";")
+                if (n < 4) { print "SKIP\tldb_format"; next }
+                # --- TDB: Target, Engine (ignored), FileSize; anything else -> skip
+                tc = ""; fsc = ""; bad = ""
+                nt = split(a[2], td, ",")
+                for (k = 1; k <= nt; k++) {
+                    split(td[k], kv, ":")
+                    if (kv[1] == "Target") { tc = clam_target(kv[2]); if (tc == "SKIP") bad = "ldb_target_" kv[2] }
+                    else if (kv[1] == "Engine") { }
+                    else if (kv[1] == "FileSize" && kv[2] ~ /^[0-9]+-[0-9]+$/) { split(kv[2], fz, "-"); fsc = "filesize >= " fz[1] " and filesize <= " fz[2] }
+                    else bad = "ldb_tdb_" kv[1]
+                    if (bad != "") break
+                }
+                if (bad != "") { print "SKIP\t" bad; next }
+                # --- subsignatures: [Offset:]Hex[::mods]
+                nsub = n - 3
+                for (k = 0; k < nsub; k++) {
+                    ss = a[k + 4]; mods = ""; off = "*"
+                    if (ss ~ /\// || ss ~ /#/ || ss ~ /\$\{/) { bad = "ldb_pcre_bytecmp_macro"; break }
+                    p = index(ss, "::")
+                    if (p) { mods = substr(ss, p + 2); ss = substr(ss, 1, p - 1) }
+                    p = index(ss, ":")
+                    if (p) { off = substr(ss, 1, p - 1); ss = substr(ss, p + 1) }
+                    if (mods != "") {
+                        if (mods !~ /^[iwfa]+$/) { bad = "ldb_modifier"; break }
+                        str = clam_hex2text(ss)
+                        if (str == "") { bad = "ldb_modifier_nonprintable"; break }
+                        if (mods ~ /i/) str = str " nocase"
+                        if (mods ~ /w/) str = str " wide"
+                        if (mods ~ /a/ || mods !~ /w/) str = str " ascii"
+                        if (mods ~ /f/) str = str " fullword"
+                    } else {
+                        str = clam_hex2yara(ss)
+                        if (str == "") { bad = "ldb_hex"; break }
+                    }
+                    S[k] = str
+                    A[k] = clam_offset(off, "$s" k)
+                    if (A[k] == "") { bad = "ldb_offset"; break }
+                    ANCH[k] = (off != "*")
+                    REF[k] = 0
+                }
+                if (bad != "") { print "SKIP\t" bad; next }
+                # --- logical expression: digits, & | ( ) and single-subsig counters =N >N <N
+                expr = a[3]; L = length(expr); j = 1; cond = ""
                 while (j <= L) {
                     ch = substr(expr, j, 1)
                     if (ch ~ /[0-9]/) {
-                        numstr = ch
-                        j++
-                        while (j <= L && substr(expr, j, 1) ~ /[0-9]/) { numstr = numstr substr(expr, j, 1); j++ }
-                        out2 = out2 "$s" numstr
-                    } else if (ch == "&") { out2 = out2 " and "; j++ }
-                    else if (ch == "|") { out2 = out2 " or "; j++ }
-                    else { out2 = out2 ch; j++ }
+                        num = ""
+                        while (j <= L && substr(expr, j, 1) ~ /[0-9]/) { num = num substr(expr, j, 1); j++ }
+                        idx = num + 0
+                        if (idx >= nsub) { bad = "ldb_expr_index"; break }
+                        REF[idx] = 1
+                        op = substr(expr, j, 1)
+                        if (op == "=" || op == ">" || op == "<") {
+                            j++; val = ""
+                            while (j <= L && substr(expr, j, 1) ~ /[0-9]/) { val = val substr(expr, j, 1); j++ }
+                            if (val == "" || substr(expr, j, 1) == "," || ANCH[idx]) { bad = "ldb_counter"; break }
+                            cond = cond "#s" idx " " (op == "=" ? "==" : op) " " val
+                        } else cond = cond A[idx]
+                    } else if (ch == "&") { cond = cond " and "; j++ }
+                    else if (ch == "|") { cond = cond " or "; j++ }
+                    else if (ch == "(") { cond = cond "("; j++ }
+                    else if (ch == ")") {
+                        cond = cond ")"; j++
+                        if (j <= L && substr(expr, j, 1) ~ /[=<>]/) { bad = "ldb_group_counter"; break }
+                    } else { bad = "ldb_expr_syntax"; break }
                 }
-                return out2
-            }
-            {
-                line = $0
-                sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
-                if (line == "" || line ~ /^#/) next
-                n = split(line, a, ":")
-                if (n < 4) next
-                ok = 1
+                if (bad != "") { print "SKIP\t" bad; next }
                 strs = ""
-                for (i = 4; i <= n; i++) {
-                    if (a[i] ~ /^\//) { ok = 0; break }
-                    yhex = ndb2yara(a[i])
-                    if (yhex == "" || length(yhex) < 8) { ok = 0; break }
-                    strs = strs "$s" (i - 4) " = { " yhex " } "
-                }
-                if (!ok) next
-                cond = translate_condition(a[3])
-                if (cond == "") next
-                rname = yara_rule_name("ldb_" FILENAME "_" NR)
-                print "YARARULE\trule " rname " { strings: " strs "condition: " cond " }"
+                for (k = 0; k < nsub; k++) if (REF[k]) strs = strs "$s" k " = " S[k] " "
+                if (strs == "") { print "SKIP\tldb_expr_syntax"; next }
+                if (fsc != "") cond = fsc " and (" cond ")"
+                if (tc != "") cond = tc " and (" cond ")"
+                print "YARARULE\trule " clam_rule_name("l", a[1]) " { " clam_meta(a[1]) "strings: " strs "condition: " cond " }"
             }
         '
         cat "$tmp_ldb_out" >> "$tmp_raw_sigs"
@@ -2581,7 +2701,31 @@ EOF
             $1 == "HEX"      { print $2 >> (out "/hex_ere.txt") }
             $1 == "YARARULE" { print $2 >> (out "/yara/generated_ndb_ldb.yar") }
             $1 == "SECTMD5"  { print $2 "\t" $3 "\t" $4 >> (out "/mdb.tsv") }
+            $1 == "YARARULE" { ny++ }
+            $1 == "SKIP"     { skip[$2]++; ns++ }
+            END {
+                if (ny + ns == 0) exit
+                for (k in skip) print k "\t" skip[k] > (out "/clamav_skipped.tsv")
+                printf "[*] ClamAV content rules -> YARA: %d converted, %d skipped (reasons: %s/clamav_skipped.tsv)\n", ny, ns, out
+            }
         ' "$tmp_raw_sigs"
+    fi
+    # ClamAV's own FP-kill lists: .ign2 = "Name[:md5]", .ign = "db:line:Name".
+    # Without this, rules ClamAV itself disabled for false positives come back.
+    if [ -s "$tmp_yara_rules" ] && [ -d "$sig_input" ]; then
+        local ign_pat="$out_dir/clamav_ign.pat"
+        bb find "$sig_input" -not -path '*/.cache/*' \( -name "*.ign2" -o -name "*.ign" \) -type f 2>/dev/null \
+            | while IFS= read -r f; do
+                case "$f" in
+                    *.ign2) bb awk -F: 'NF && $1 !~ /^#/ { print "clamav = \"" $1 "\" " }' "$f" ;;
+                    *)      bb awk -F: 'NF >= 3 { print "clamav = \"" $3 "\" " }' "$f" ;;
+                esac
+              done > "$ign_pat"
+        if [ -s "$ign_pat" ]; then
+            bb grep -vF -f "$ign_pat" "$tmp_yara_rules" > "$tmp_yara_rules.f" || true
+            mv -f "$tmp_yara_rules.f" "$tmp_yara_rules"
+        fi
+        rm -f "$ign_pat"
     fi
     rm -f "$tmp_raw_sigs"
 
@@ -2751,6 +2895,37 @@ EOF
     # matches" instead of "totally broken".
     local yara_extvars=(-d filename= -d filepath= -d extension=)
 
+    # The generated ClamAV file holds every converted rule. The per-FILE
+    # check below would drop ALL of them for a single bad rule (that is
+    # exactly how 100% of NDB/LDB rules ended up disabled before, C6).
+    # Validate it in chunks; only a failing chunk is checked rule by rule.
+    if [ -s "$tmp_yara_rules" ] && [ -n "$YARAC_BIN" ] && \
+       ! "$YARAC_BIN" "${yara_extvars[@]}" "$tmp_yara_rules" /dev/null &>/dev/null; then
+        local vdir vbad=0 vc vl
+        vdir=$(mktemp -d "${TMPDIR:-/tmp}/av_yval.XXXXXX") || vdir=""
+        if [ -n "$vdir" ]; then
+            bb split -l 2000 "$tmp_yara_rules" "$vdir/c_"
+            : > "$vdir/good"
+            for vc in "$vdir"/c_*; do
+                if "$YARAC_BIN" "${yara_extvars[@]}" "$vc" /dev/null &>/dev/null; then
+                    cat "$vc" >> "$vdir/good"
+                    continue
+                fi
+                while IFS= read -r vl; do
+                    printf '%s\n' "$vl" > "$vdir/one.yar"
+                    if "$YARAC_BIN" "${yara_extvars[@]}" "$vdir/one.yar" /dev/null &>/dev/null; then
+                        printf '%s\n' "$vl" >> "$vdir/good"
+                    else
+                        vbad=$((vbad + 1))
+                    fi
+                done < "$vc"
+            done
+            mv -f "$vdir/good" "$tmp_yara_rules"
+            rm -rf "$vdir"
+            echo -e "${Y}[WARN] Dropped ${vbad} converted ClamAV rule(s) that YARA rejects; the rest stay active${Z}"
+        fi
+    fi
+
     local yar_sources
     yar_sources=$(bb find "$out_dir/yara" -maxdepth 1 \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null)
     if [ -n "$yar_sources" ] && [ -n "$YARAC_BIN" ]; then
@@ -2827,7 +3002,7 @@ EOF
           "$out_dir"/str_sig_map.tsv "$cache_dir/" 2>/dev/null || true
     [ -d "$out_dir/yara" ] && cp -rf "$out_dir/yara" "$cache_dir/" 2>/dev/null
     touch "$compiled_flag" 2>/dev/null || true
-    printf '%s' "$VERSION" > "$version_flag" 2>/dev/null || true
+    printf '%s' "$cache_tag" > "$version_flag" 2>/dev/null || true
 
     echo -e "  SHA256 : ${C}$(bb wc -l < "$out_dir/sha256.tsv" 2>/dev/null | tr -d ' ')${Z}"
     echo -e "  SHA1   : ${C}$(bb wc -l < "$out_dir/sha1.tsv" 2>/dev/null | tr -d ' ')${Z}"
@@ -3979,6 +4154,16 @@ main() {
     init_toolchain
     YARA_CMD=$(detect_yara)
     detect_yarac
+    export ORPHUS_QUARANTINE_MAX="$QUARANTINE_MAX"
+    if [ "$CLAMD_SCAN" = true ]; then
+        if command -v clamdscan &>/dev/null && printf '' | clamdscan --no-summary - &>/dev/null; then
+            export ORPHUS_CLAMD=1
+            echo -e "${G}[OK] --clamd: clamd is reachable, every file is also scanned by ClamAV${Z}"
+        else
+            echo -e "${R}[FAIL] --clamd: clamdscan not found or clamd is not running${Z}"
+            exit 2
+        fi
+    fi
     [ -x "$SCRIPT_DIR/bin/grep" ] && GREP_BIN="$SCRIPT_DIR/bin/grep"
 
     # --update is a standalone action (like typical AV tools separate
@@ -4089,6 +4274,8 @@ main() {
         "$WORK_DIR"/*) : ;;
         /dev/shm/av_sigs_*) rm -rf "$SIG_DIR" 2>/dev/null ;;
     esac
+    # Exit code for cron/monitoring (H9): 0 = clean, 1 = threats found.
+    [ "${TT:-0}" -gt 0 ] && exit 1
     exit 0
 }
 
@@ -4305,6 +4492,8 @@ declare -a BATCH_SHA=()
 declare -a BATCH_SHA1=()
 declare -a BATCH_MD5=()
 declare -a BATCH_YARA=()
+declare -a BATCH_CLAMD=()
+CLAMD_BATCH_CNT=0
 declare -a BATCH_HEUR=()
 declare -a BATCH_PE=()
 SHA_BATCH_CNT=0
@@ -5462,10 +5651,34 @@ progress() {
 # ----------------------------------------------------------------------------
 # MODULE: quarantine
 # ----------------------------------------------------------------------------
+QUARANTINED_COUNT=0
 quarantine_file() {
     local src="$1" type="${2:-UNKNOWN}"
     [ -n "$QUARANTINE_DIR" ] || return 0
     [ -f "$src" ] || return 0
+
+    # C4 safety rails. Only signature-based findings are moved; heuristic
+    # ones (timeouts, permissions, base64, SUID, disguised files) are
+    # report-only, since moving a legitimate site file breaks the site.
+    case "$type" in
+        KNOWN_MALWARE|KNOWN_MALWARE_SECTION|CLAMAV_MATCH|YARA_MATCH|SIG_STRING_MATCH|HEX_SIG_MATCH) ;;
+        *) log "QUARANTINE_SKIPPED (report-only type): $src ($type)"; return 0 ;;
+    esac
+    # Never move a symlink, and move the RESOLVED path, refusing system
+    # locations: a directory swapped for a symlink to /etc after detection
+    # must not get /etc/shadow moved (narrows the race; bash cannot openat).
+    if [ -L "$src" ]; then log "QUARANTINE_SKIPPED (symlink): $src ($type)"; return 0; fi
+    local real
+    real=$(realpath -e -- "$src" 2>/dev/null || readlink -f -- "$src" 2>/dev/null) || real=""
+    case "$real" in
+        ""|/etc/*|/usr/*|/bin/*|/sbin/*|/lib/*|/lib32/*|/lib64/*|/libx32/*|/boot/*|/root/*|/proc/*|/sys/*|/dev/*|/var/lib/*)
+            log "QUARANTINE_SKIPPED (system or unresolvable path '${real}'): $src ($type)"; return 0 ;;
+    esac
+    # Mass-quarantine brake: a bad signature update must not empty a site.
+    if [ "$QUARANTINED_COUNT" -ge "${ORPHUS_QUARANTINE_MAX:-100}" ]; then
+        log "QUARANTINE_SKIPPED (limit ${ORPHUS_QUARANTINE_MAX:-100} reached, --quarantine-max): $src ($type)"
+        return 0
+    fi
 
     # --quarantine-dry-run: report what would happen, touch nothing. The
     # real value here is -w (real-time) running unattended in production
@@ -5488,14 +5701,22 @@ quarantine_file() {
     ts=$(date +%s)
     path_hash=$(printf '%s' "$src" | bb sha256sum 2>/dev/null | bb grep -oE '[0-9a-f]{64}' | head -1)
     [ -z "$path_hash" ] && path_hash="$(date +%s%N)_$$"
-    qfile="${QUARANTINE_DIR}/${path_hash}_$(basename -- "$src")"
+    # Timestamp in the name: a re-infected path must not overwrite the
+    # earlier evidence copy; basename capped to stay under NAME_MAX.
+    local base; base=$(basename -- "$src"); base="${base:0:120}"
+    qfile="${QUARANTINE_DIR}/${path_hash}_${ts}_${base}"
+    local meta sum
+    meta=$(stat -c '%u:%g:%a' -- "$real" 2>/dev/null)
+    sum=$(bb sha256sum -- "$real" 2>/dev/null | cut -d' ' -f1)
 
-    if mv -f -- "$src" "$qfile" 2>/dev/null; then
+    if mv -- "$real" "$qfile" 2>/dev/null; then
         chmod "$QUARANTINE_PERM" "$qfile" 2>/dev/null
+        QUARANTINED_COUNT=$(( QUARANTINED_COUNT + 1 ))
         # Manifest for restore: original_path <TAB> quarantined_file <TAB>
-        # threat_type <TAB> unix_time. Restore = mv "$qfile" "$src".
-        printf '%s\t%s\t%s\t%s\n' "$src" "$qfile" "$type" "$ts" >> "${QUARANTINE_DIR}/manifest.tsv"
-        log "QUARANTINED: $src -> $qfile ($type)"
+        # threat_type <TAB> unix_time <TAB> uid:gid:mode <TAB> sha256.
+        # Restore = mv "$qfile" "$src"; chown/chmod from column 5.
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$real" "$qfile" "$type" "$ts" "$meta" "$sum" >> "${QUARANTINE_DIR}/manifest.tsv"
+        log "QUARANTINED: $real -> $qfile ($type)"
     else
         log "QUARANTINE_FAILED (mv error): $src ($type)"
     fi
@@ -5528,15 +5749,22 @@ process_hash_batch() {
     # benchmark). Same fix already applied to the string-signature search
     # — use _real_grep (bundled/system grep) here too.
     local hits
-    hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | _real_grep -F -f - "$sig_file" 2>/dev/null | cut -f1)
+    # coreutils prints "\<hash>  <escaped name>" for names containing "\" or
+    # a newline (H2), so the leading "\" is stripped before the lookup.
+    hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | sed 's/^\\//' | _real_grep -F -f - "$sig_file" 2>/dev/null | cut -f1 | sort -u)
     if [ -n "$hits" ]; then
+        local hit_hash tname ln h f
         while IFS= read -r hit_hash; do
             [ -z "$hit_hash" ] && continue
-            local tname
             tname=$(_real_grep -m 1 "^${hit_hash}" "$sig_file" 2>/dev/null | cut -f2)
-            local hit_file
-            hit_file=$(printf '%s\n' "$out" | bb grep -iE "^${hit_hash}\s+" | sed 's/^[^ ]*[ ]*//' | head -1)
-            [ -n "$hit_file" ] && threat "KNOWN_MALWARE" "$hit_file" "name=${tname:-Malware}|$htype=$hit_hash"
+            # Report EVERY file with this hash, not just the first (H10).
+            while IFS= read -r ln; do
+                # "<hash><space><mode: space or *><name>"
+                h="${ln%% *}"; f="${ln:${#h}+2}"
+                if [ "${h:0:1}" = '\' ]; then h="${h:1}"; f=$(printf '%b' "$f"); fi
+                [ "${h,,}" = "${hit_hash,,}" ] && [ -n "$f" ] && \
+                    threat "KNOWN_MALWARE" "$f" "name=${tname:-Malware}|$htype=$hit_hash"
+            done <<< "$out"
         done <<< "$hits"
     fi
 }
@@ -5582,6 +5810,23 @@ _yara_bisect_slow_batch() {
             threat "YARA_MATCH" "$yfile" "rule=$yrule"
         fi
     done
+}
+
+# --clamd: hand the batch to a running clamd (exact ClamAV engine with its
+# own freshclam-updated, signature-checked DB). --fdpass lets clamd read
+# files its own user has no permission for.
+process_clamd_batch() {
+    [ $# -eq 0 ] && return
+    local listfile line path name
+    listfile=$(mktemp 2>/dev/null) || return
+    printf '%s\n' "$@" > "$listfile"
+    while IFS= read -r line; do
+        case "$line" in *" FOUND") ;; *) continue ;; esac
+        line="${line% FOUND}"
+        path="${line%: *}"; name="${line##*: }"
+        threat "CLAMAV_MATCH" "$path" "sig=$name"
+    done < <(clamdscan --fdpass --no-summary --infected --file-list="$listfile" 2>/dev/null)
+    rm -f "$listfile"
 }
 
 process_yara_batch() {
@@ -5892,10 +6137,28 @@ check_file_heuristics() {
 # ----------------------------------------------------------------------------
 # MODULE: scan loop (lives inside a function so "local" is valid)
 # ----------------------------------------------------------------------------
-run_scan_loop() {
-    local col1 col2 col3 file size oct magic_type skip_deep ext
+# Run every partially filled batch and reset it. Called at the end of the
+# pool and, in real-time mode, whenever the FIFO is idle for 2 s: before,
+# a new file waited for 199 more files before hash/YARA ran (C2).
+_flush_batches() {
+    if [ "$SHA_BATCH_CNT" -gt 0 ]; then _timed_hash_batch "sha256" "$SIG_DIR/sha256.tsv" "${BATCH_SHA[@]}"; BATCH_SHA=(); SHA_BATCH_CNT=0; fi
+    if [ "$SHA1_BATCH_CNT" -gt 0 ]; then _timed_hash_batch "sha1" "$SIG_DIR/sha1.tsv" "${BATCH_SHA1[@]}"; BATCH_SHA1=(); SHA1_BATCH_CNT=0; fi
+    if [ "$MD5_BATCH_CNT" -gt 0 ]; then _timed_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"; BATCH_MD5=(); MD5_BATCH_CNT=0; fi
+    if [ "$YARA_BATCH_CNT" -gt 0 ]; then _timed_yara_batch "${BATCH_YARA[@]}"; BATCH_YARA=(); YARA_BATCH_CNT=0; fi
+    if [ "$CLAMD_BATCH_CNT" -gt 0 ]; then process_clamd_batch "${BATCH_CLAMD[@]}"; BATCH_CLAMD=(); CLAMD_BATCH_CNT=0; fi
+    if [ "$HEUR_BATCH_CNT" -gt 0 ]; then _timed_heur_batch "${BATCH_HEUR[@]}"; BATCH_HEUR=(); HEUR_BATCH_CNT=0; fi
+    if [ "$PE_BATCH_CNT" -gt 0 ]; then _timed_pe_batch "${BATCH_PE[@]}"; BATCH_PE=(); PE_BATCH_CNT=0; fi
+    return 0
+}
 
-    while IFS=$'\t' read -r col1 col2 col3; do
+run_scan_loop() {
+    local col1 col2 col3 file size oct magic_type skip_deep ext rc
+
+    while :; do
+        IFS=$'\t' read -r -t 2 col1 col2 col3; rc=$?
+        # >128 = read timed out (idle FIFO in -w mode): flush and keep waiting.
+        if [ "$rc" -gt 128 ]; then _flush_batches; continue; fi
+        [ "$rc" -ne 0 ] && [ -z "$col1" ] && break
         file=""; size=""; oct=""
         if [ -n "${col3:-}" ]; then
             size="$col1"; oct="$col2"; file="$col3"
@@ -5980,6 +6243,15 @@ run_scan_loop() {
                 fi
             fi
 
+            if [ "${ORPHUS_CLAMD:-0}" = 1 ]; then
+                BATCH_CLAMD+=("$file")
+                CLAMD_BATCH_CNT=$(( CLAMD_BATCH_CNT + 1 ))
+                if [ "$CLAMD_BATCH_CNT" -ge "$BATCH_SIZE" ]; then
+                    process_clamd_batch "${BATCH_CLAMD[@]}"
+                    BATCH_CLAMD=(); CLAMD_BATCH_CNT=0
+                fi
+            fi
+
             # Batched strings/hex heuristic matching (see process_heuristic_batch)
             if [ "$HAS_STRINGS" = true ] || [ "$HAS_HEX_ERE" = true ]; then
                 BATCH_HEUR+=("$file")
@@ -6000,6 +6272,20 @@ run_scan_loop() {
                     BATCH_PE=(); PE_BATCH_CNT=0
                 fi
             fi
+        else
+            # Over MAX_SIZE: a webshell padded past the limit used to skip
+            # every check (H1). Script files still get hash + YARA; big
+            # media/backups stay skipped to spare disk I/O.
+            case "${file##*.}" in
+                [pP][hH][pP]*|[pP][hH][tT][mM][lL]|[pP][hH][aA][rR]|[iI][nN][cC]|[jJ][sS]|[pP][lL]|[pP][yY]|[sS][hH]|[cC][gG][iI])
+                    if [ "$HAS_SHA256" = true ] && [ "$SHA256_CMD" != "none" ]; then
+                        BATCH_SHA+=("$file"); SHA_BATCH_CNT=$(( SHA_BATCH_CNT + 1 ))
+                    fi
+                    if [ "$HAS_YARA" = true ]; then
+                        BATCH_YARA+=("$file"); YARA_BATCH_CNT=$(( YARA_BATCH_CNT + 1 ))
+                    fi
+                    ;;
+            esac
         fi
 
         # Archive scanning (-A/--scan-archives) — deliberately OUTSIDE the
@@ -6016,13 +6302,7 @@ run_scan_loop() {
         [ $(( FILES_SCANNED % 50 )) -eq 0 ] && progress "$file"
     done < "$POOL_FILE"
 
-    # Flush remaining batches
-    [ "$SHA_BATCH_CNT" -gt 0 ] && _timed_hash_batch "sha256" "$SIG_DIR/sha256.tsv" "${BATCH_SHA[@]}"
-    [ "$SHA1_BATCH_CNT" -gt 0 ] && _timed_hash_batch "sha1" "$SIG_DIR/sha1.tsv" "${BATCH_SHA1[@]}"
-    [ "$MD5_BATCH_CNT" -gt 0 ] && _timed_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
-    [ "$YARA_BATCH_CNT" -gt 0 ] && _timed_yara_batch "${BATCH_YARA[@]}"
-    [ "$HEUR_BATCH_CNT" -gt 0 ] && _timed_heur_batch "${BATCH_HEUR[@]}"
-    [ "$PE_BATCH_CNT" -gt 0 ] && _timed_pe_batch "${BATCH_PE[@]}"
+    _flush_batches
 }
 
 # ----------------------------------------------------------------------------
