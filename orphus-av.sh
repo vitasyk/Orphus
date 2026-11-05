@@ -2891,8 +2891,7 @@ EOF
             {
                 line = $0
                 if (line == "" || line ~ /^#/) next
-                rname = "strsig_" NR "_" FILENAME
-                gsub(/[^a-zA-Z0-9_]/, "_", rname)
+                rname = "strsig_" NR
                 print "rule " rname " { strings: $a = \"" esc(line) "\" nocase ascii condition: $a }" >> yarout
                 print rname "\t" line >> mapout
             }
@@ -2933,7 +2932,10 @@ EOF
     # files are excluded from sig_files/generic_files below so they're
     # compiled as actual YARA rules, not misrouted as hash/pattern text.
     if [ -d "$sig_input" ]; then
-        bb find "$sig_input" -not -path '*/.git/*' -not -path '*/.cache/*' \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null | head -500 | while read -r yf; do
+        local yar_total
+        yar_total=$(bb find "$sig_input" -not -path '*/.git/*' -not -path '*/.cache/*' \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null | bb wc -l | tr -d ' ')
+        [ "${yar_total:-0}" -gt 500 ] && echo -e "${Y}[WARN] ${yar_total} YARA rule files found, only the first 500 are used${Z}"
+        bb find "$sig_input" -not -path '*/.git/*' -not -path '*/.cache/*' \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null | sort | head -500 | while read -r yf; do
             cp "$yf" "$out_dir/yara/" 2>/dev/null || true
         done
     fi
@@ -3129,6 +3131,28 @@ _sweep_stale_shm_dirs() {
         esac
         _dead_pid "$pid" && rm -rf "$d" 2>/dev/null
     done
+}
+
+# Self-test: a broken ruleset (failed compile, wrong flags) otherwise
+# looks exactly like "0 threats, CLEAN". The built-in string signature
+# "eval(base64_decode" is always compiled into the YARA set.
+yara_self_test() {
+    [ "$YARA_CMD" != "none" ] || return 0
+    local target="" flags=(-d filename= -d filepath= -d extension=) probe
+    if [ -f "$SIG_DIR/yara/rules.yarc" ]; then target="$SIG_DIR/yara/rules.yarc"; flags+=(-C)
+    elif [ -f "$SIG_DIR/yara/index.yar" ]; then target="$SIG_DIR/yara/index.yar"
+    else
+        echo -e "${R}[FAIL] YARA self-test: no compiled YARA ruleset -> YARA detection is OFF${Z}"
+        return 0
+    fi
+    probe=$(mktemp "$WORK_DIR/selftest.XXXXXX") || return 0
+    printf '<?php eval(base64_decode("dGVzdA==")); ?>\n' > "$probe"
+    if $YARA_CMD "${flags[@]}" "$target" "$probe" 2>/dev/null | grep -q .; then
+        echo -e "${G}[OK] YARA self-test passed${Z}"
+    else
+        echo -e "${R}[FAIL] YARA self-test: the ruleset did not match the built-in test string -> YARA detection is NOT working${Z}"
+    fi
+    rm -f "$probe"
 }
 
 init_workdir() {
@@ -3646,7 +3670,10 @@ collect_files() {
     fi
 
     if [ "$sys_find_printf_ok" = true ]; then
-        command find "$ROOT_DIR" -type f "${excl[@]}" -printf "%s\t%m\t%T@\t%p\n" 2>/dev/null > "$WORK_DIR/all_files_raw.tsv"
+        # Third field is the incremental-cache key: ctime:dev:inode, not
+        # mtime — mtime is forgeable with `touch -r` after editing (H4),
+        # ctime is not settable by an unprivileged user.
+        command find "$ROOT_DIR" -type f "${excl[@]}" -printf "%s\t%m\t%C@:%D:%i\t%p\n" 2>/dev/null > "$WORK_DIR/all_files_raw.tsv"
         apply_incremental_filter
     else
         # No printf-capable find available (BSD find on macOS, or no
@@ -4252,6 +4279,7 @@ main() {
 
     extract_worker
     compile_signatures "$SIGNATURES" "$SIG_DIR"
+    yara_self_test
 
     if [ "$SCAN_PROCESSES" = true ]; then
         if [ -n "$OFFLINE_ROOT" ]; then
