@@ -60,6 +60,10 @@ rule=SharedStrings[|][^|]*/libmemcached
 rule=Bolonyokte[|][^|]*/usr/local/mgr5/
 rule=overwrite_globals_hack[|][^|]*/engine/classes/min/lib/JSMinify[.]php$
 rule=php_malfunctions[|][^|]*(/ace/mode-|/vim/vim[0-9]+/autoload/phpcomplete)
+# Yara-Rules MALW_Magento_suspicious.yar: bare php_uname() call (WP/Joomla/Drupal/Laravel/Stripe SDK)
+rule=php_uname[|]
+# Yara-Rules MALW_Miscelanea_Linux.yar "rootkit" = syscall names; Perl's generated syscall.ph lists them all (only under /usr: a site can't plant one)
+rule=rootkit[|]/usr/[^|]*/perl[0-9.]*/[^|]*/syscall[.]ph$
  
 # --- not executable content: database files and web-server access logs ---
 [|][^|]*/var/lib/mysql[^|]*[.](ibd|MYI|MYD|frm)$
