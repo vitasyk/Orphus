@@ -238,6 +238,9 @@
 #                            apt/dnf/yum/zypper/pacman/apk is present).
 #   --yara-url-sha256 HASH    Expected SHA256 of the --yara-url tarball;
 #                            without it the download is refused.
+#                            All --setup / busybox downloads are checked
+#                            against pinned SHA256; other versions or URLs
+#                            are refused unless ORPHUS_ALLOW_UNPINNED=1.
 #   --yara-url URL            Install yara/yarac from a prebuilt tarball at
 #                            this URL instead of compiling — no compiler
 #                            needed on the target machine. YARA publishes no
@@ -2440,6 +2443,13 @@ EOF
             gsub(/["\\]/, "", m)
             return "meta: clamav = \"" m "\" "
         }
+        # Linux/web mode also filters by the ClamAV name prefix (platform):
+        # ~73% of "any file" rules are Win.* and only cost scan time here.
+        function clam_platform_ok(name,    p) {
+            if (CLAM_WIN) return 1
+            p = name; sub(/[.].*/, "", p)
+            return (p ~ /^(Unix|Html|Js|Php|Txt|Py|Perl|Asp|Xml|Java|Multios|Email|PUA)$/)
+        }
         BEGIN {
             for (i = 0; i < 10; i++) HEXV[i ""] = i
             HEXV["a"] = 10; HEXV["b"] = 11; HEXV["c"] = 12; HEXV["d"] = 13; HEXV["e"] = 14; HEXV["f"] = 15
@@ -2535,6 +2545,7 @@ EOF
                 if (n < 4) { print "SKIP\tndb_format"; next }
                 tc = clam_target(a[2])
                 if (tc == "SKIP") { print "SKIP\tndb_target_" a[2]; next }
+                if (!clam_platform_ok(a[1])) { print "SKIP\tndb_platform"; next }
                 yhex = clam_hex2yara(a[4])
                 if (yhex == "") { print "SKIP\tndb_hex"; next }
                 sc = clam_offset(a[3], "$a")
@@ -2565,6 +2576,7 @@ EOF
                 # Real format: Name;TargetDescriptionBlock;LogicalExpression;Subsig0;Subsig1;...
                 n = split(line, a, ";")
                 if (n < 4) { print "SKIP\tldb_format"; next }
+                if (!clam_platform_ok(a[1])) { print "SKIP\tldb_platform"; next }
                 # --- TDB: Target, Engine (ignored), FileSize; anything else -> skip
                 tc = ""; fsc = ""; bad = ""
                 nt = split(a[2], td, ",")
