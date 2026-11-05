@@ -4484,12 +4484,16 @@ _rt_snapshot() {
 _rt_poll_once() {
     local known="$WORK_DIR/rt_known.tsv" cur="$WORK_DIR/rt_current.tsv" line p
     _rt_snapshot > "$cur"
-    LC_ALL=C comm -13 "$known" "$cur" | while IFS= read -r line; do
+    LC_ALL=C comm -13 "$known" "$cur" | uniq | while IFS= read -r line; do
         # no TAB = tail of a newline-split name (busybox stat output)
         [[ "$line" == *$'\t'* ]] || continue
         p="${line#*$'\t'}"
-        [ -e "$p" ] || p="${p//$'\001'/$'\n'}"
-        [ -n "$p" ] && feed_realtime_path "$p"
+        [ -n "$p" ] || continue
+        feed_realtime_path "$p"
+        # \001 may be an encoded newline or a literal byte; a planted literal
+        # twin must not hide the newline-named file, so feed both (a path
+        # that doesn't exist is dropped by feed_realtime_path).
+        [[ "$p" == *$'\001'* ]] && feed_realtime_path "${p//$'\001'/$'\n'}"
     done
     mv -f "$cur" "$known"
 }
