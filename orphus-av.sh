@@ -5682,7 +5682,11 @@ scan_archive() {
     stage_dir=$(mktemp -d "${extract_dir}_in.XXXXXX" 2>/dev/null) || { rm -rf "$extract_dir"; return; }
     _ACTIVE_EXTRACT_DIRS+=("$stage_dir")
     staged="$stage_dir/${cur##*/}"
-    if ! cp -- "$cur" "$staged" 2>/dev/null; then
+    # -P + checks on the copy: the file may have been swapped for a symlink
+    # (/etc/shadow, /dev/zero) or a FIFO since it was listed.
+    timeout 30 cp -P -- "$cur" "$staged" 2>/dev/null
+    if [ -L "$staged" ] || [ ! -f "$staged" ] || \
+       [ "$(_stat_size "$staged" 2>/dev/null || echo 0)" -gt $(( ARCHIVE_MAX_MB * 1024 * 1024 )) ]; then
         rm -rf "$extract_dir" "$stage_dir"; return
     fi
     chmod 0400 "$staged" 2>/dev/null
